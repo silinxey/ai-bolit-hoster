@@ -1,0 +1,37 @@
+{
+  "applications": {
+    "wp_core": {
+      "domain_name": "SELECT option_value from %db%.%prefix%options WHERE option_name = 'siteurl';",
+      "wp_comments": {
+        "key": "comment_ID",
+        "fields": [
+          "comment_content",
+          "comment_author_email"
+        ]
+      },
+      "wp_posts": {
+        "key": "ID",
+        "fields": [
+          "post_content"
+        ]
+      },
+      "wp_options": {
+        "key": "option_id",
+        "fields": [
+          "option_value"
+        ],
+        "escaped" : true,
+        "base64"  : true
+      }
+    },
+    "joomla_core": {
+      "joomla_something": {
+        "key": "id",
+        "fields": [
+          "comments",
+          "posts"
+        ]
+      }
+    }
+  }
+}

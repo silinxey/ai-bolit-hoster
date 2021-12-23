@@ -86,7 +86,7 @@ publish, disclose, distribute, display, or transcribe in any fashion any of
 the Programs to others or for any use other than as provided by this EULA,
 and any such attempted rental, selling, leasing, licensing, sublicensing,
 assignment, transfer, publishing, disclosure, distribution, display or
-transcription shall be null and void.  вЂњConfidential InformationвЂќ shall
+transcription shall be null and void.  “Confidential Information” shall
 mean the Programs, any intellectual property of Cloud Linux or any other
 information that characterizes as confidential at the time of its disclosure
 either in writing or orally, except for information which you can demonstrate:
@@ -126,7 +126,7 @@ Programs to you.  No person other than Cloud Linux, in writing, is authorized
 to make any representation or warranty to you regarding the Programs.
 Exclusive Remedy: In the event of a breach of the limited warranty above,
 your exclusive remedy relative to the Programs shall be for Cloud Linux,
-at Cloud LinuxвЂ™s option, to either: (i) replace the Programs that does not
+at Cloud Linux’s option, to either: (i) replace the Programs that does not
 meet the limited warranty; or (ii) refund to you the Programs license fees
 (and no other fees) paid by you, during the 12 month period immediately
 preceding the breach of the limited warranty, for the Programs which fails
@@ -158,12 +158,12 @@ license will automatically terminate, without notice, if you fail to comply
 with any provision of this License Agreement. Upon termination of this License
 Agreement, all rights granted to you pursuant to this License Agreement will
 terminate and revert to Cloud Linux. This license may be terminated at any
-time, for any reason, by Cloud Linux. Cloud LinuxвЂ™s maximum liability for
+time, for any reason, by Cloud Linux. Cloud Linux’s maximum liability for
 any such termination is to refund to you any prepaid fees.
 
 6. PERSONAL INFORMATION CONTROL.  You agree to comply with all applicable laws,
 regulations, rulings and orders of the EU, US and other countries (including
-but not limited to the EUвЂ™s GDPR) in which you have operations relating
+but not limited to the EU’s GDPR) in which you have operations relating
 to the protection, use, and distribution of personal information of your
 users or visitors on any devices which have the Program installed or stored.
 Further, you shall indemnify Cloud Linux for any and all claims resulting
@@ -174,7 +174,30 @@ rulings and executive orders of the United States relating to the exportation
 or importation of any copies of the Programs (including but not limited to
 the export and destination control regulations of the Commerce and Treasury
 Department) and with all applicable foreign laws relating to the use,
-importation, licensing or distribution of copies of the Programs.
+importation, licensing or distribution of copies of the Programs. You
+acknowledge that Cloud Linux is subject to economic sanctions laws (“Economic
+Sanctions Laws”), including but not limited to those enforced by the
+U.S. Department of the Treasury’s Office of Foreign Assets Control (“OFAC”),
+the European Union, and the United Kingdom. Accordingly, You shall comply with
+all Economic Sanctions Laws, including, but not limited to, those of the United
+States, the European Union, and the United Kingdom. You shall not provide
+access to the Cloud Linux Products to any individuals identified on OFAC’s list
+of Specially Designated Nationals (“SDN List”), the UK’s HM Treasury’s
+Consolidated List of Sanctions Targets, or the EU’s Consolidated List of
+Persons, Groups, and Entities Subject to EU Financial Sanctions (collectively
+“Sanctioned Parties”). You shall not take any action which would place Cloud
+Linux in a position of non-compliance with any such Economic Sanctions
+Laws. Furthermore, You represent and warrants that (i) you have not in the past
+been, and will not be in the future, be connected with any Sanctioned Parties,
+(ii) shall provide such information regarding any individual or entity which
+you do business within any location covered by Economic Sanction Laws upon
+request of Cloud Linux, and (iii) shall promptly advise Cloud Linux of any
+activities which increases the risk of your’s non-compliance with this Section
+7 or Cloud Linux’ compliance with Economic Sanctions Laws. You agree to
+indemnify and hold Cloud Linux harmless from any loss, damages, liability or
+expenses incurred by Cloud Linux as a result of your failure to comply with any
+export regulations or restrictions or otherwise fails to comply with this
+Section 7.
 
 8. GENERAL.  This License Agreement shall be governed by and construed in
 accordance with the laws of the State of Delaware and the United States,
