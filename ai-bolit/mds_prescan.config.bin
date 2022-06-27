@@ -1,1 +1,1 @@
-$$FF$$ LIKE '%<script%' OR $$FF$$ LIKE '%<iframe%' OR $$FF$$ LIKE '%<object%' OR $$FF$$ LIKE '%<embed%' OR $$FF$$ LIKE '%fromCharCode%' OR $$FF$$ LIKE '%setTimeout%' OR $$FF$$ LIKE '%setInterval%' OR $$FF$$ LIKE '%<?php%'
+$$FF$$ LIKE '%<script%' OR $$FF$$ LIKE '%<iframe%' OR $$FF$$ LIKE '%<object%' OR $$FF$$ LIKE '%<embed%' OR $$FF$$ LIKE '%fromCharCode%' OR $$FF$$ LIKE '%setTimeout%' OR $$FF$$ LIKE '%setInterval%' OR $$FF$$ LIKE '%<?php%' OR $$FF$$ LIKE '%href%'

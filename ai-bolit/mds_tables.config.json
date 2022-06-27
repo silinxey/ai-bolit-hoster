@@ -20,6 +20,9 @@
         "fields": [
           "option_value"
         ],
+        "fields_additional_data": [
+          "option_name"
+        ],
         "escaped" : true,
         "base64"  : true
       }

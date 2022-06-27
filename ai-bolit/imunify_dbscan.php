@@ -8,6 +8,7 @@ $print              = true;
 $report             = null;
 $lic                = null;
 $detached           = null;
+$scanned = 0;
 
 if (!isset($argv)) {
     $argv = $_SERVER['argv'];
@@ -15,6 +16,10 @@ if (!isset($argv)) {
 
 $config = new MDSConfig();
 $cli = new MDSCliParse($argv, $config);
+
+if (!$config->get(MDSConfig::PARAM_DO_NOT_USE_UMASK)) {
+    umask(0027);
+}
 
 Factory::configure($config->get(MDSConfig::PARAM_FACTORY_CONFIG));
 
@@ -31,19 +36,13 @@ if ($config->get(MDSConfig::PARAM_SEARCH_CONFIGS) !== '') {
     $filter = new MDSCMSConfigFilter();
     $finder = new Finder($filter, $config->get(MDSConfig::PARAM_SEARCH_DEPTH));
     $creds = new MDSDBCredsFromConfig($finder, $config->get(MDSConfig::PARAM_SEARCH_CONFIGS));
-    $tty = true;
-    if (function_exists('stream_isatty') && !@stream_isatty(STDOUT)) {
-        $tty = false;
-    }
-    if ($tty) {
+    if ($config->get(MDSConfig::PARAM_USE_STDOUT)) {
         $creds->printCreds();
     } else {
         $creds->printForXArgs();
     }
     exit(0);
 }
-
-echo 'MDS - an Intelligent Malware Database Scanner for Websites.' . PHP_EOL;
 
 $log_levels = explode(',', $config->get(MDSConfig::PARAM_LOG_LEVEL));
 $log = new Logger($config->get(MDSConfig::PARAM_LOG_FILE), $log_levels);
@@ -62,8 +61,6 @@ if ($config->get(MDSConfig::PARAM_DETACHED)) {
 }
 
 $filter = new MDSAVDPathFilter($config->get(MDSConfig::PARAM_IGNORELIST));
-
-$scanned = 0;
 
 list($scan_signatures, $clean_db) = loadMalwareSigns($config);
 
@@ -91,6 +88,24 @@ set_exception_handler(function ($ex) use ($report, $print, $detached, $config, $
     }
 });
 
+if (
+    $detached === null
+    && ($config->get(MDSConfig::PARAM_SCAN) || $config->get(MDSConfig::PARAM_CLEAN))
+    && $config->get(MDSConfig::PARAM_REPORT_FILE) === null
+    && !@is_writable('/var/imunify360/tmp')
+) {
+    throw new MDSException(MDSErrors::MDS_NO_REPORT);
+}
+
+if (
+    $detached === null
+    && $config->get(MDSConfig::PARAM_CLEAN)
+    && $config->get(MDSConfig::PARAM_BACKUP_FILEPATH) === ''
+    && !@is_writable('/var/imunify360/tmp')
+) {
+    throw new MDSException(MDSErrors::MDS_NO_BACKUP);
+}
+
 $progress = new MDSProgress($config->get(MDSConfig::PARAM_PROGRESS));
 $progress->setPrint(
     function ($text) {
@@ -107,16 +122,22 @@ if (is_string($config->get(MDSConfig::PARAM_AVD_APP))) {
     $config->set(MDSConfig::PARAM_AVD_APP, $tables_config->getSupportedApplications());
 }
 
-if (is_string($config->get(MDSConfig::PARAM_AVD_PATH)) && substr($config->get(MDSConfig::PARAM_AVD_PATH), -1) == DIRECTORY_SEPARATOR) {
-    $config->set(MDSConfig::PARAM_AVD_PATH, substr($config->get(MDSConfig::PARAM_AVD_PATH), 0, -1));
+if (is_string($config->get(MDSConfig::PARAM_AVD_PATH))) {
+    if (substr($config->get(MDSConfig::PARAM_AVD_PATH), -1) === DIRECTORY_SEPARATOR) {
+        $config->set(MDSConfig::PARAM_AVD_PATH, substr($config->get(MDSConfig::PARAM_AVD_PATH), 0, -1));
+    } else if (substr($config->get(MDSConfig::PARAM_AVD_PATH), -2) === DIRECTORY_SEPARATOR . '*') {
+        $config->set(MDSConfig::PARAM_AVD_PATH, substr($config->get(MDSConfig::PARAM_AVD_PATH), 0, -2));
+    }
 }
 
 if ($config->get(MDSConfig::PARAM_AVD_PATHS) && file_exists($config->get(MDSConfig::PARAM_AVD_PATHS))) {
     $paths = file($config->get(MDSConfig::PARAM_AVD_PATHS), FILE_SKIP_EMPTY_LINES | FILE_IGNORE_NEW_LINES);
     foreach ($paths as &$path) {
         $path = base64_decode($path);
-        if (substr($path, -1) == DIRECTORY_SEPARATOR) {
+        if (substr($path, -1) === DIRECTORY_SEPARATOR) {
             $path = substr($path, 0, -1);
+        } else if (substr($path, -2) === DIRECTORY_SEPARATOR . '*') {
+            $path = substr($path, 0, -2);
         }
     }
     $config->set(MDSConfig::PARAM_AVD_PATHS, $paths);
@@ -224,7 +245,7 @@ function getCreds($config, $argc, $argv, $progress)
         $creds = $avd_creds->getCredsFromApps($paths, $config->get(MDSConfig::PARAM_AVD_APP), $recursive);
         $progress->setDbCount($avd_creds->getAppsCount());
     } elseif ($config->get(MDSConfig::PARAM_CREDS_FROM_XARGS)) {
-        $creds_xargs = explode(';;', $argv[$argc - 1]);
+        $creds_xargs = explode(';;', substr($argv[$argc - 1], 1, -1));
         $creds[] = [
             'db_host'   => $creds_xargs[0],
             'db_port'   => $creds_xargs[1],
@@ -279,7 +300,7 @@ function scanDB($config, $scan_signatures, $progress, $log, $tables_config, $pre
         }
 
         if (!$config->get(MDSConfig::PARAM_REPORT_FILE)) {
-            $report_file = __DIR__ . '/' . $report_filename;
+            $report_file = @is_writable('/var/imunify360/tmp') ? '/var/imunify360/tmp/' . $report_filename : __DIR__ . '/' . $report_filename;
         } else {
             if (is_dir($config->get(MDSConfig::PARAM_REPORT_FILE))) {
                 $report_file = $config->get(MDSConfig::PARAM_REPORT_FILE) . '/' . $report_filename;
@@ -358,7 +379,7 @@ function scanDB($config, $scan_signatures, $progress, $log, $tables_config, $pre
             MDSScanner::scan($prescan, $config->get(MDSConfig::PARAM_DATABASE), $config->get(MDSConfig::PARAM_PREFIX),
                 $mds_find, $db_connection, $scan_signatures,
                 $config->get(MDSConfig::PARAM_MAX_CLEAN_BATCH), $clean_db, $progress, $state, $report, $backup,
-                $config->get(MDSConfig::PARAM_SCAN), $config->get(MDSConfig::PARAM_CLEAN), $log);
+                $config->get(MDSConfig::PARAM_SCAN), $config->get(MDSConfig::PARAM_CLEAN), $log, $config->get(MDSConfig::PARAM_SIZE_LIMIT));
         }
 
         if ($config->get(MDSConfig::PARAM_RESTORE)) {
@@ -372,7 +393,7 @@ function scanDB($config, $scan_signatures, $progress, $log, $tables_config, $pre
 
         $ch = null;
         if (!$config->get(MDSConfig::PARAM_DO_NOT_SEND_STATS)) {
-            $request = new MDSCHRequest();
+            $request = new SendMessageRequest('MDS');
             $ch = Factory::instance()->create(MDSSendToCH::class, [$request, $lic]);
         }
 
@@ -383,6 +404,8 @@ function scanDB($config, $scan_signatures, $progress, $log, $tables_config, $pre
 
         $db_connection->close();
         $log->info('MDS DB scan: finished ' . $config->get(MDSConfig::PARAM_DATABASE));
+
+        $progress->setCurrentDb($i, $config->get(MDSConfig::PARAM_DATABASE), true);
 
     } catch (MDSException $ex) {
         onError($detached, $progress, $report, $ex);
@@ -596,6 +619,7 @@ class MDSConfig extends Config
 {
     const PARAM_HELP                = 'help';
     const PARAM_VERSION             = 'version';
+    const PARAM_USE_STDOUT          = 'stdout';
     const PARAM_HOST                = 'host';
     const PARAM_PORT                = 'port';
     const PARAM_LOGIN               = 'login';
@@ -635,6 +659,9 @@ class MDSConfig extends Config
     const PARAM_RESCAN              = 'rescan';
     const PARAM_IGNORELIST          = 'ignore-list';
     const PARAM_OPERATION           = 'op';
+    const PARAM_DO_NOT_USE_UMASK    = 'do-not-use-umask';
+    const PARAM_MEMORY_LIMIT        = 'memory';
+    const PARAM_SIZE_LIMIT          = 'size';
 
     /**
      * @var array Default config
@@ -661,6 +688,7 @@ class MDSConfig extends Config
             MDSSendToCH::class              => MDSSendToCH::class,
             MDSCollectUrlsRequest::class    => MDSCollectUrlsRequest::class,
         ],
+        self::PARAM_USE_STDOUT          => true,
         self::PARAM_AV_DB               => null,
         self::PARAM_PROCU_DB            => null,
         self::PARAM_SHARED_MEM          => false,
@@ -687,16 +715,20 @@ class MDSConfig extends Config
         self::PARAM_RESCAN              => false,
         self::PARAM_IGNORELIST          => false,
         self::PARAM_OPERATION           => false,
+        self::PARAM_DO_NOT_USE_UMASK    => false,
+        self::PARAM_MEMORY_LIMIT        => '1G',
+        self::PARAM_SIZE_LIMIT          => '650K'
     ];
 
     /**
      * Construct
      */
-    public function __construct() 
+    public function __construct()
     {
         $this->setDefaultConfig($this->defaultConfig);
     }
 }
+
 /*
  * Abstract class for parse cli command
  */
@@ -920,11 +952,14 @@ class MDSCliParse extends CliParse
         MDSConfig::PARAM_AVD_PATH               => ['short' => '',  'long' => 'path',                   'needValue' => true],
         MDSConfig::PARAM_AVD_PATHS              => ['short' => '',  'long' => 'paths',                  'needValue' => true],
         MDSConfig::PARAM_IGNORELIST             => ['short' => '',  'long' => 'ignore-list',            'needValue' => true],
+        MDSConfig::PARAM_DO_NOT_USE_UMASK       => ['short' => '',  'long' => 'do-not-use-umask',       'needValue' => false],
+        MDSConfig::PARAM_MEMORY_LIMIT           => ['short' => '',  'long' => 'memory',                 'needValue' => true],
+        MDSConfig::PARAM_SIZE_LIMIT             => ['short' => '',  'long' => 'size',                   'needValue' => true],
     ];
 
     /**
      * Parse comand line params
-     * 
+     *
      * @return void
      * @throws Exception
      */
@@ -945,7 +980,7 @@ class MDSCliParse extends CliParse
             }
             $this->config->set($configName, $result);
         }
-        
+
         $factoryConfig = $this->config->get(MDSConfig::PARAM_FACTORY_CONFIG);
 
         if ($this->config->get(MDSConfig::PARAM_SCAN)) {
@@ -955,7 +990,27 @@ class MDSCliParse extends CliParse
         } else if ($this->config->get(MDSConfig::PARAM_RESTORE)) {
             $this->config->set(MDSConfig::PARAM_OPERATION, MDSConfig::PARAM_RESTORE);
         }
-        
+
+        if (function_exists('stream_isatty') && !@stream_isatty(STDOUT)) {
+            $this->config->set(MDSConfig::PARAM_USE_STDOUT, false);
+        }
+
+        if ($this->config->get(MDSConfig::PARAM_USE_STDOUT)) {
+            echo 'MDS - an Intelligent Malware Database Scanner for Websites.' . PHP_EOL;
+        }
+
+        if ($this->config->get(MDSConfig::PARAM_MEMORY_LIMIT) && ($mem = AibolitHelpers::getBytes($this->config->get(MDSConfig::PARAM_MEMORY_LIMIT))) > 0) {
+            $this->config->set(MDSConfig::PARAM_MEMORY_LIMIT, $mem);
+            ini_set('memory_limit', $mem);
+            if ($this->config->get(MDSConfig::PARAM_USE_STDOUT)) {
+                echo 'Changed memory limit to ' . $this->config->get(MDSConfig::PARAM_MEMORY_LIMIT) . PHP_EOL;
+            }
+        }
+
+        if ($this->config->get(MDSConfig::PARAM_SIZE_LIMIT) && ($mem = AibolitHelpers::getBytes($this->config->get(MDSConfig::PARAM_SIZE_LIMIT))) > 0) {
+            $this->config->set(MDSConfig::PARAM_SIZE_LIMIT, $mem);
+        }
+
         if ($this->config->get(MDSConfig::PARAM_HELP)) {
             $this->showHelp();
         }
@@ -965,21 +1020,19 @@ class MDSCliParse extends CliParse
         elseif (!$this->config->get(MDSConfig::PARAM_OPERATION) && !$this->config->get(MDSConfig::PARAM_SEARCH_CONFIGS)) {
             $this->showHelp();
         }
-        
-        // here maybe re-define some of $factoryConfig elements 
-        
+        // here maybe re-define some of $factoryConfig elements
         $this->config->set(MDSConfig::PARAM_FACTORY_CONFIG, $factoryConfig);
     }
-    
+
     /**
      * Cli show help
-     * 
+     *
      * @return void
      */
     private function showHelp()
     {
+        $memory_limit = ini_get('memory_limit');
         echo <<<HELP
-MDS - an Intelligent Malware Database Scanner for Websites.
 
 Usage: php {$_SERVER['PHP_SELF']} [OPTIONS]
 
@@ -1015,6 +1068,8 @@ Usage: php {$_SERVER['PHP_SELF']} [OPTIONS]
       --path=<path>                     Scan/clean CMS dbs from <path> with help AppVersionDetector
       --paths=<file>                    Scan/clean CMS dbs base64 encoded paths from <file> with help AppVersionDetector
       --app-name=<app-name>             Filter AppVersionDetector dbs for scan with <app-name>. Currently supported only 'wp-core'.
+      --do-not-use-umask                MDS uses umask 0027, but if you use this parameter, then umask will not be set
+      --memory=SIZE                     Maximum amount of memory a script may consume. Current value: {$memory_limit}.
 
   -h, --help                            Display this help and exit
   -v, --version                         Show version
@@ -1026,7 +1081,7 @@ HELP;
 
     /**
      * Cli show version
-     * 
+     *
      * @return void
      */
     private function showVersion()
@@ -1035,6 +1090,7 @@ HELP;
         exit(0);
     }
 }
+
 /**
  * Class MDSTablesConfig for work with config file in MDS
  */
@@ -1083,7 +1139,9 @@ class MDSTablesConfig
      */
     public function getTableFields($application, $table)
     {
-        return $this->raw_config['applications'][$application][$table]['fields'] ?? [];
+        $fields = $this->raw_config['applications'][$application][$table]['fields'] ?? [];
+        $add_fields = $this->raw_config['applications'][$application][$table]['fields_additional_data'] ?? [];
+        return array_merge($fields, $add_fields);
     }
 
     /**
@@ -1189,6 +1247,7 @@ class MDSTablesConfig
         return isset($this->raw_config['applications'][$application]['domain_name']) ? $this->raw_config['applications'][$application]['domain_name'] : '';
     }
 }
+
 /**
  * Class MDSFindTables Find tables that we have in config
  */
@@ -1299,6 +1358,7 @@ class MDSJSONReport
     private $urls_counter = 0;
 
     private $table_total_rows = [];
+    private $table_fields_data = [];
 
     private $count_tables_scanned   = 0;
     private $running_time           = 0;
@@ -1504,9 +1564,9 @@ class MDSJSONReport
      * @param int $row_id
      * @return void
      */
-    public function addDetected($signature_id, $snippet, $table_name, $row_id, $field = '')
+    public function addDetected($signature_id, $snippet, $table_name, $row_id, $field = '', $field_data = [])
     {
-        $this->addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, self::STATUS_DETECTED, $this->report_scan);
+        $this->addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, $field_data, self::STATUS_DETECTED, $this->report_scan);
     }
 
     /**
@@ -1517,9 +1577,9 @@ class MDSJSONReport
      * @param int $row_id
      * @return void
      */
-    public function addDetectedUrl($signature_id, $snippet, $table_name, $row_id, $field = '')
+    public function addDetectedUrl($signature_id, $snippet, $table_name, $row_id, $field = '', $field_data = [])
     {
-        $this->addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, self::STATUS_DETECTED, $this->report_url_scan);
+        $this->addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, $field_data, self::STATUS_DETECTED, $this->report_url_scan);
     }
 
     /**
@@ -1559,14 +1619,14 @@ class MDSJSONReport
      * @param int $row_id
      * @return void
      */
-    public function addCleaned($signature_id, $snippet, $table_name, $row_id, $field = '')
+    public function addCleaned($signature_id, $snippet, $table_name, $row_id, $field = '', $field_data = [])
     {
         $report = &$this->report_clean;
         if (strpos($signature_id, 'CMW-URL-') === 0) {
             $report = &$this->report_url_clean;
         }
 
-        $this->addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, self::STATUS_CLEAN, $report);
+        $this->addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, $field_data, self::STATUS_CLEAN, $report);
     }
 
     /**
@@ -1590,7 +1650,7 @@ class MDSJSONReport
      */
     public function addRestored($table_name, $row_id, $field = '')
     {
-        $this->addSignatureRowId('', '', $table_name, $row_id, $field, self::STATUS_RESTORE, $this->report);
+        $this->addSignatureRowId('', '', $table_name, $row_id, $field, [],self::STATUS_RESTORE, $this->report);
         $this->rows_restored++;
     }
 
@@ -1611,16 +1671,17 @@ class MDSJSONReport
     public function save()
     {
         $report = $this->prepareReport();
+
+        if(isset($this->ch)) {
+            $this->ch->prepareData($report);
+            $this->ch->send();
+        }
+
         $json = json_encode($report);
         file_put_contents($this->report_filename, $json);
 
         if ($this->unknown_urls_send !== '' && !empty($this->unknown_urls)) {
             $this->unknown_urls_send->send(array_keys($this->unknown_urls));
-        }
-
-        if(isset($this->ch)) {
-            $this->ch->prepareData($report);
-            $this->ch->send();
         }
     }
 
@@ -1669,6 +1730,7 @@ class MDSJSONReport
             'app_owner_uid'                         => $this->app_owner_uid,
             'path'                                  => $this->path,
             'base64_sup'                            => $this->base64,
+            'mem_peak'                              => memory_get_peak_usage(true),
         ];
         if ($this->scan_id) {
             $report['scan_id'] = $this->scan_id;
@@ -1700,9 +1762,10 @@ class MDSJSONReport
                 $fields_data = [];
                 foreach ($fields as $field => $row_ids) {
                     $fields_data[] = [
-                        'field'     => $field,
-                        'row_ids'   => $row_ids,
-                        'row_inf'   => count($row_ids),
+                        'field'           => $field,
+                        'additional_data' => $this->table_fields_data[$signature_id][$table_name][$field] ?? (object)[],
+                        'row_ids'         => $row_ids,
+                        'row_inf'         => count($row_ids),
                     ];
                 }
                 if ($fields_data) {
@@ -1724,6 +1787,19 @@ class MDSJSONReport
         return $reports;
     }
 
+    private function addTableAdditionalData($table, $data)
+    {
+        $res = (array)$table;
+        foreach ($data as $field => $values) {
+            foreach ($values as $value) {
+                if (!in_array($value, $res[$field] ?? [])) {
+                    $res[$field][] = $value;
+                }
+            }
+        }
+        return (object)$res;
+    }
+
     /**
      * General method for adding detection and clean information
      * @param string $signature_id
@@ -1734,7 +1810,7 @@ class MDSJSONReport
      * @param array  &$report
      * @return void
      */
-    private function addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, $status = self::STATUS_DETECTED, &$report = null)
+    private function addSignatureRowId($signature_id, $snippet, $table_name, $row_id, $field, $field_data, $status = self::STATUS_DETECTED, &$report = null)
     {
         if ($this->initReportRow($signature_id, $snippet, $status, $report)) {
             if ($status == self::STATUS_DETECTED) {
@@ -1750,6 +1826,7 @@ class MDSJSONReport
         if (!isset($report[$signature_id]['tables_info'][$table_name][$field])) {
             $report[$signature_id]['tables_info'][$table_name][$field] = [];
         }
+        $this->table_fields_data[$signature_id][$table_name][$field] = (object)$this->addTableAdditionalData($this->table_fields_data[$signature_id][$table_name][$field] ?? [], $field_data);
         $report[$signature_id]['tables_info'][$table_name][$field][] = $row_id;
         if (!isset($this->uniq_tables_affected[$status][$table_name][$field][$row_id])) {
             if ($status === self::STATUS_DETECTED) {
@@ -1807,6 +1884,35 @@ class MDSJSONReport
         ];
         return true;
     }
+
+    public static function removeKeysFromReport($report, $keys)
+    {
+        self::array_walk_recursive_delete($report, function($value, $key, $userdata) use ($keys) {
+            return in_array($key, $keys, true);
+        });
+        return $report;
+    }
+
+    /**
+     * Remove any elements where the callback returns true
+     *
+     * @param  array    $array    the array to walk
+     * @param  callable $callback callback takes ($value, $key, $userdata)
+     * @param  mixed    $userdata additional data passed to the callback.
+     * @return array
+     */
+    private static function array_walk_recursive_delete(array &$array, callable $callback, $userdata = null)
+    {
+        foreach ($array as $key => &$value) {
+            if (is_array($value)) {
+                $value = self::array_walk_recursive_delete($value, $callback, $userdata);
+            }
+            if ($callback($value, $key, $userdata)) {
+                unset($array[$key]);
+            }
+        }
+        return $array;
+    }
 }
 
 /**
@@ -1853,7 +1959,7 @@ class MDSProgress
      */
     public function __construct($file = false, $update_interval = 0, $file_write_interval = 1, $shared_mem = false, $need_create_shmem = false)
     {
-        $this->start = time();
+        $this->start = AibolitHelpers::currentTime();
         $this->update_interval = $update_interval;
         $this->file_write_interval = $file_write_interval;
         if ($shared_mem) {
@@ -1928,10 +2034,21 @@ class MDSProgress
      * @param $i - index of currently scanned table
      * @param $table - name of currently scanned table
      */
-    public function setCurrentTable($i, $table)
+    public function setCurrentTable($i, $table, $completed = false)
     {
-        $new_percent = number_format(($this->current_db_num * $this->one_db_percent) + ($i * $this->one_table_percent), 1);
+
+        $new_percent = number_format(($this->current_db_num * $this->one_db_percent) + (($i + ($completed ? 1 : 0)) * $this->one_table_percent), 1);
         $this->progress_string = str_replace(substr($this->progress_string, 0, strpos($this->progress_string, '% of whole scan')), '[' . ($i + 1) . '/' . $this->num_tables . ' tbls of ' . ($this->current_db_num + 1) . '/' . $this->db_count . ' dbs] ' . $new_percent, $this->progress_string);
+        if ($completed) {
+            $start = @strpos($this->progress_string, '% of whole scan/') + 16;
+            $end = @strpos($this->progress_string, '%', $start);
+            $this->progress_string = substr_replace($this->progress_string, '100.0', $start, $end - $start);
+
+            $start_count = @strpos($this->progress_string, '] ', $end) + 2;
+            $end_count = @strpos($this->progress_string, ' rows', $end);
+            $this->progress_string = substr_replace($this->progress_string, $this->total_table . ' of ' . $this->total_table, $start_count, $end_count - $start_count);
+
+        }
         $this->current_table_num = $i;
         $this->current_table = $table;
         $this->percent_main = $new_percent;
@@ -1944,9 +2061,9 @@ class MDSProgress
      * @param $i - index of currently scanned table
      * @param $table - name of currently scanned table
      */
-    public function setCurrentDb($i, $db)
+    public function setCurrentDb($i, $db, $completed = false)
     {
-        $new_percent = number_format($i * $this->one_db_percent, 1);
+        $new_percent = number_format(($i + ($completed ? 1 : 0)) * $this->one_db_percent, 1);
         $this->progress_string = str_replace(substr($this->progress_string, 0, strpos($this->progress_string, '% of whole scan')), '[' . ($this->current_table_num + 1) . '/' . $this->num_tables . ' tbls of ' . ($i + 1) . '/' . $this->db_count . ' dbs] ' . $new_percent, $this->progress_string);
         $this->current_db_num = $i;
         $this->current_db = $db;
@@ -1990,7 +2107,7 @@ class MDSProgress
 
         $corrected_start_value = $row_id - $this->first_table_key;
         $percent_table = number_format($this->total_table ? $corrected_start_value * 100 / $this->total_table : 0, 1);
-        $elapsed_time    = microtime(true) - $this->start;
+        $elapsed_time  = AibolitHelpers::currentTime() - $this->start;
 
         $stat            = '';
         $left            = 0;
@@ -2072,6 +2189,7 @@ class MDSProgress
         $this->shared_mem = null;
     }
 }
+
 /**
  * Class MDSScan module for scan string with signatures
  */
@@ -2096,15 +2214,11 @@ class MDSScan
         $processResult = function ($checker, $content, $l_Pos, $l_SigId, &$return) use (&$result, $signature_db) {
             $return = null;
             $result = [
-                'content' => self::getFragment($content, $l_Pos),
-                'pos' => $l_Pos,
-                'sigid' => $l_SigId,
+                'content'   => self::getFragment($content, $l_Pos),
+                'pos'       => $l_Pos,
+                'sigid'     => $l_SigId,
+                'sn'        => isset($l_SigId) && isset($signature_db->_Mnemo[$l_SigId]) ? $signature_db->_Mnemo[$l_SigId] : '',
             ];
-            if (isset($l_SigId) && isset($signature_db->_Mnemo[$l_SigId])) {
-                $result['sn'] = $signature_db->_Mnemo[$l_SigId];
-            } else {
-                $result['sn'] = '';
-            }
         };
 
         $processUrlResult = function ($checker, $content, $l_Pos, $l_SigId, &$return) use (&$resultUrl, $signature_db) {
@@ -2112,9 +2226,9 @@ class MDSScan
             if (isset($l_Pos['black'])) {
                 for ($i=0, $iMax = count($l_Pos['black']); $i < $iMax; $i++) {
                     $resultUrl['black'][] = [
-                        'content' => self::getFragment($content, $l_Pos['black'][$i]),
-                        'pos' => $l_Pos['black'][$i],
-                        'sigid' => $l_SigId['black'][$i],
+                        'content'   => self::getFragment($content, $l_Pos['black'][$i]),
+                        'pos'       => $l_Pos['black'][$i],
+                        'sigid'     => $l_SigId['black'][$i],
                     ];
                 }
             }
@@ -2122,9 +2236,9 @@ class MDSScan
             if (isset($l_Pos['unk'])) {
                 for ($i=0, $iMax = count($l_Pos['unk']); $i < $iMax; $i++) {
                     $resultUrl['unk'][] = [
-                        'content' => self::getFragment($content, $l_Pos['unk'][$i]),
-                        'pos' => $l_Pos['unk'][$i],
-                        'sigid' => $l_SigId['unk'][$i],
+                        'content'   => self::getFragment($content, $l_Pos['unk'][$i]),
+                        'pos'       => $l_Pos['unk'][$i],
+                        'sigid'     => $l_SigId['unk'][$i],
                     ];
                 }
             }
@@ -2196,6 +2310,7 @@ class MDSScan
         return $l_Res;
     }
 }
+
 /**
  * Class MDSPreScanQuery generates PreScan SQL Query to get suspicious rows
  */
@@ -2207,6 +2322,7 @@ class MDSPreScanQuery
     private $key;
     private $table;
     private $fields;
+    private $fields_data;
     private $prescan;
     private $b64_template;
 
@@ -2214,22 +2330,26 @@ class MDSPreScanQuery
      * MDSPreScanQuery constructor.
      * @param $prescan
      * @param $fields
+     * @param $fields_data
      * @param $key
      * @param $table
      * @param $db
      * @param int $limit
      * @param int $last
+     * @param int $size_limit
      */
-    public function __construct($prescan, $fields, $key, $table, $db, $limit = 0, $last = 0)
+    public function __construct($prescan, $fields, $fields_data, $key, $table, $db, $size_limit, $limit = 0, $last = 0)
     {
         $this->b64_template = 'CHAR_LENGTH($$FF$$) % 4 = 0 AND $$FF$$ REGEXP \'^[-A-Za-z0-9+/]*={0,3}$\'';
         $this->limit = $limit;
         $this->prescan = $prescan;
         $this->fields = $fields;
+        $this->fields_data = $fields_data;
         $this->key = $key;
         $this->table = $table;
         $this->last = $last;
         $this->db = $db;
+        $this->size_limit = $size_limit;
         $this->generateAliases();
     }
 
@@ -2253,6 +2373,31 @@ class MDSPreScanQuery
             }
         }
         return false;
+    }
+
+    /**
+     * @param $field
+     * @return bool|string
+     */
+    public function getAliasByField($field)
+    {
+        return $this->aliases[$field] ?? false;
+    }
+
+    /**
+     * @return array
+     */
+    public function getFields()
+    {
+        return $this->fields;
+    }
+
+    /**
+     * @return array
+     */
+    public function getFieldsData()
+    {
+        return $this->fields_data;
     }
 
     /**
@@ -2288,69 +2433,58 @@ class MDSPreScanQuery
     }
 
     /**
-     * Generate pre scan sql query with base64 checking
+     * Generate pre scan sql query with or without base64 checking
+     * @param boolean $base64 - base64 usage flag
      * @return string
      */
-    public function generateSqlQueryWithBase64()
+    public function generateSqlQuery($base64 = false)
     {
         $res = 'SELECT ';
-        $numItems = count($this->aliases);
+        $numItems = count($this->fields);
         $i = 0;
-        foreach($this->aliases as $column => $alias) {
-            $res .= '`' . $column . '`' . ' as ' . $alias;
-            if ($alias === 'mds_key') {
-                break;
+        foreach($this->fields as $column) {
+            $res .= 'HEX(`' . $column . '`)' . ' as ' . $this->aliases[$column];
+            if ($base64) {
+                $res .= str_replace('$$FF$$', '`' . $column . '`', ', IF (' . $this->prescan . ', 1, 0) as ' . $this->aliases[$column] . '_norm');
+                $res .= str_replace('$$FF$$', 'FROM_BASE64(`' . $column . '`)', ', IF (' . $this->prescan . ', 1, 0) as ' . $this->aliases[$column] . '_b64');
             }
-            $res .= str_replace('$$FF$$', '`' . $column . '`', ', IF (' . $this->prescan . ', 1, 0) as ' . $alias . '_norm');
-            $res .= str_replace('$$FF$$', 'FROM_BASE64(`' . $column . '`)', ', IF (' . $this->prescan . ', 1, 0) as ' . $alias . '_b64');
-            if(++$i !== $numItems) {
+            $res .= ',';
+        }
+        $res .= '`' . $this->getFieldByAlias('mds_key') . '`' . ' as ' . 'mds_key';
+        if (count($this->fields_data ?? []) > 0) {
+            $res .= ',';
+        }
+
+        $fields_data_count = count($this->fields_data);
+        foreach($this->fields_data as $column) {
+            $res .= '`' . $column . '`' . ' as ' . $this->aliases[$column];
+            if(++$i !== $fields_data_count) {
                 $res .= ',';
             }
         }
+
         $res .= ' FROM `' . $this->db . '`.`' . $this->table . '`';
         $res .= ' WHERE `' . $this->key . '` > ' . $this->last;
         $res .= ' AND ';
         $res .= ' (';
-        $res .= '(' . $this->generatePreScanClause() . ')';
-        $res .= ' OR (' . $this->generatePreScanClause(true) . ')';
+        if ($base64) {
+            $res .= '(' . $this->generatePreScanClause() . ')';
+            $res .= ' OR (' . $this->generatePreScanClause(true) . ')';
+        } else {
+            $res .= $this->generatePreScanClause();
+        }
         $res .= ')';
-        $res .= ' HAVING ';
-        $i = 0;
-        foreach($this->aliases as $alias) {
-            if ($alias === 'mds_key') {
-                break;
-            }
-            $res .= $alias . '_norm = 1' . ' OR ' . $alias . '_b64 = 1';
-            if(++$i !== $numItems - 1) {
-                $res .= ' OR ';
+        if ($base64) {
+            $res .= ' HAVING ';
+            $i = 0;
+            foreach($this->fields as $column) {
+                $res .= $this->aliases[$column] . '_norm = 1' . ' OR ' . $this->aliases[$column] . '_b64 = 1';
+                if(++$i !== $numItems) {
+                    $res .= ' OR ';
+                }
             }
         }
-        $res .= ' ORDER BY `' . $this->key . '`';
-        if ($this->limit > 0) {
-            $res .= ' LIMIT ' . $this->limit;
-        }
-        $res .= ';';
-        return $res;
-    }
 
-    /**
-     * Generate pre scan sql query
-     * @return string
-     */
-    public function generateSqlQuery()
-    {
-        $res = 'SELECT ';
-        $numItems = count($this->aliases);
-        $i = 0;
-        foreach($this->aliases as $column => $alias) {
-            $res .= '`' . $column . '` as ' . $alias;
-            if(++$i !== $numItems) {
-                $res .= ',';
-            }
-        }
-        $res .= ' FROM `' . $this->db . '`.`' . $this->table . '`';
-        $res .= ' WHERE `' . $this->key . '` > ' . $this->last;
-        $res .= ' AND (' . $this->generatePreScanClause() . ')';
         $res .= ' ORDER BY `' . $this->key . '`';
         if ($this->limit > 0) {
             $res .= ' LIMIT ' . $this->limit;
@@ -2365,7 +2499,7 @@ class MDSPreScanQuery
     private function generateAliases()
     {
         $alphabet = 'abcdefghijklmnopqrstuvwxyz';
-        $fields = $this->fields;
+        $fields = array_merge($this->fields, $this->fields_data ?? []);
         $res = [];
         for ($i = 0, $iMax = count($fields); $i < $iMax; $i++) {
             $res[$fields[$i]] = $alphabet[$i];
@@ -2384,7 +2518,9 @@ class MDSPreScanQuery
         $template = $base64 ? $this->b64_template : $this->prescan;
         $res = '';
         for ($i = 0, $iMax = count($this->fields); $i < $iMax; $i++) {
+            $res .= '(LENGTH(`' . $this->fields[$i] . '`) <= ' . $this->size_limit . ' AND ';
             $res .= str_replace('$$FF$$', '`' . $this->fields[$i] . '`', '(' . $template . ')');
+            $res .= ')';
             if ($i !== $iMax - 1) {
                 $res .= ' OR ';
             }
@@ -2422,7 +2558,7 @@ class MDSScannerTable
         if ($progress instanceof MDSProgress) {
             $progress->setKeysRange($min_key, $last_key);
         }
-        $pre_query = (isset($table_config['base64']) && $table_config['base64'] === true) ? $query->generateSqlQueryWithBase64() : $query->generateSqlQuery();
+        $pre_query = $query->generateSqlQuery(isset($table_config['base64']) && $table_config['base64'] === true);
         $res = $connection->query($pre_query);
         if (self::isCanceled($state)) {
             $log->info('Task canceled');
@@ -2458,7 +2594,8 @@ class MDSScannerTable
                                     $v->getScan()->getMalwareRes()->getSnippet(),
                                     $query->getTable(),
                                     $v->getKey(),
-                                    $v->getField()
+                                    $v->getField(),
+                                    $v->getFieldsData()
                                 );
                             }
                             $detected++;
@@ -2480,7 +2617,8 @@ class MDSScannerTable
                                         $url->getSnippet(),
                                         $query->getTable(),
                                         $v->getKey(),
-                                        $v->getField()
+                                        $v->getField(),
+                                        $v->getFieldsData()
                                     );
                                 }
                                 $detected_url++;
@@ -2510,7 +2648,8 @@ class MDSScannerTable
                     }
                     $list->clear();
                 }
-            } else {
+            }
+            else {
                 $i = $max_clean;
                 while (true) {
                     $row = $res->fetch_assoc();
@@ -2550,7 +2689,8 @@ class MDSScannerTable
                                     $entry->getScan()->getMalwareRes()->getSnippet(),
                                     $query->getTable(),
                                     $entry->getKey(),
-                                    $entry->getField()
+                                    $entry->getField(),
+                                    $entry->getFieldsData()
                                 );
                             }
                             $detected++;
@@ -2572,7 +2712,8 @@ class MDSScannerTable
                                         $url->getSnippet(),
                                         $query->getTable(),
                                         $entry->getKey(),
-                                        $entry->getField()
+                                        $entry->getField(),
+                                        $entry->getFieldsData()
                                     );
                                 }
                                 $detected_url++;
@@ -2612,7 +2753,7 @@ class MDSScannerTable
                                     $sig)
                             );
                             $report->addCleaned($sig, $entry->getScan()->getSnippet(),
-                                $query->getTable(), $entry->getKey(), $entry->getField());
+                                $query->getTable(), $entry->getKey(), $entry->getField(), $entry->getFieldsData());
                         }
                     }
                     $total_scanned += $list->getCount();
@@ -2623,7 +2764,7 @@ class MDSScannerTable
                     $list->clear();
                 }
             }
-            $pre_query = (isset($table_config['base64']) && $table_config['base64'] === true) ? $query->generateSqlQueryWithBase64() : $query->generateSqlQuery();
+            $pre_query = $query->generateSqlQuery(isset($table_config['base64']) && $table_config['base64'] === true);
             $res = $connection->query($pre_query);
         }
 
@@ -2669,6 +2810,8 @@ class MDSScannerTable
  */
 class MDSScanner
 {
+    const QUERY_DATA_PART_LIMIT = 3000;
+
     /**
      * @param string                $prescan - prescan string
      * @param string                $database - db name (null to scan all dbs that user have access to)
@@ -2684,13 +2827,14 @@ class MDSScanner
      * @param MDSBackup             $backup
      * @param bool                  $scan
      * @param bool                  $clean
-     * @param Logger $log
+     * @param Logger                $log
+     * @param int                   $size_limit
      * @throws Exception
      */
-    public static function scan($prescan, $database, $prefix, $mds_find, $connection, $scan_signatures, $max_clean = 100, $clean_db = null, $progress = null, $state = null, $report = null, $backup = null, $scan = true, $clean = false, $log = null)
+    public static function scan($prescan, $database, $prefix, $mds_find, $connection, $scan_signatures, $max_clean = 100, $clean_db = null, $progress = null, $state = null, $report = null, $backup = null, $scan = true, $clean = false, $log = null, $size_limit = 650 * 1024)
     {
 
-        $start_time = microtime(true);
+        $start_time = AibolitHelpers::currentTime();
 
         $tables = $mds_find->find($database, $prefix);
         if (empty($tables)) {
@@ -2708,27 +2852,25 @@ class MDSScanner
 
         $log->info('MDS Scan: started');
 
-        if ($progress instanceof MDSProgress) {
-            $progress->setCurrentTable(0, $tables[0]);
-        }
-        
         foreach($tables as $i => $table) {
-            $scan_signatures->setOwnUrl($table['domain_name']);
-            $prescan_query = new MDSPreScanQuery($prescan, $table['config']['fields'], $table['config']['key'], $table['table'], $table['db'], 10000);
-
-            $log->debug(sprintf('Scanning table: "%s"', $table['table']));
-            MDSScannerTable::scan($connection, $prescan_query, $scan_signatures, $max_clean, $clean_db, $progress, $state, $report, $backup, $log, $table['config']);
             if ($progress instanceof MDSProgress) {
                 $progress->setCurrentTable($i, $table);
             }
-        }
-        
-        if ($report !== null) {
-            $report->setCountTablesScanned(count($tables));
-            $report->setRunningTime(microtime(true) - $start_time);
+            $scan_signatures->setOwnUrl($table['domain_name']);
+            $prescan_query = new MDSPreScanQuery($prescan, $table['config']['fields'], $table['config']['fields_additional_data'] ?? [], $table['config']['key'], $table['table'], $table['db'], $size_limit, self::QUERY_DATA_PART_LIMIT);
+            $log->debug(sprintf('Scanning table: "%s"', $table['table']));
+            MDSScannerTable::scan($connection, $prescan_query, $scan_signatures, $max_clean, $clean_db, $progress, $state, $report, $backup, $log, $table['config']);
+            if ($progress instanceof MDSProgress) {
+                $progress->setCurrentTable($i, $table, true);
+            }
         }
 
-        $log->info(sprintf('MDS Scan: finished. Time taken: %f second(s)', microtime(true) - $start_time));
+        if ($report !== null) {
+            $report->setCountTablesScanned(count($tables));
+            $report->setRunningTime(AibolitHelpers::currentTime() - $start_time);
+        }
+
+        $log->info(sprintf('MDS Scan: finished. Time taken: %f second(s)', AibolitHelpers::currentTime() - $start_time));
 
         if ($progress instanceof MDSProgress) {
             $progress->finalize();
@@ -2739,6 +2881,7 @@ class MDSScanner
         }
     }
 }
+
 /**
  * The MDSState class is needed to pass the MDS state of work
  */
@@ -2747,14 +2890,14 @@ class MDSState
     private $cache_ttl              = 1; //sec
     private $cache_data             = null;
     private $last_update_time_cache = 0;
-    
+
     const STATE_NEW         = 'new';
     const STATE_WORKING     = 'working';
     const STATE_DONE        = 'done';
     const STATE_CANCELED    = 'canceled';
 
     private $state_filepath = null;
-   
+
     /**
      * MDSState constructor.
      * @param string $state_filepath
@@ -2765,7 +2908,7 @@ class MDSState
         $this->state_filepath   = $state_filepath;
         $this->cache_ttl        = $cache_ttl;
     }
-    
+
     /**
      * Scan or cure process not started
      * @return bool
@@ -2774,7 +2917,7 @@ class MDSState
     {
         return $this->getCurrentState() == self::STATE_NEW;
     }
-    
+
     /**
      * The scan or cure process is currently running
      * @return bool
@@ -2792,7 +2935,7 @@ class MDSState
     {
         return $this->getCurrentState() == self::STATE_CANCELED;
     }
-    
+
     /**
      * The scan or cure process is done
      * @return bool
@@ -2833,7 +2976,7 @@ class MDSState
         $this->setCache($new_data);
         return $new_data == self::STATE_CANCELED;
     }
-    
+
     // /////////////////////////////////////////////////////////////////////////
 
     /**
@@ -2853,7 +2996,7 @@ class MDSState
         if (flock($fh, LOCK_EX)) {
             $data   = trim(stream_get_contents($fh));
             $result = $edit_func($data);
-            
+
             fseek($fh, 0);
             ftruncate($fh, 0);
             fwrite($fh, $result);
@@ -2934,6 +3077,7 @@ class MDSState
     }
 
 }
+
 /**
  * Class MDSBackup Backup data to csv
  */
@@ -2949,8 +3093,8 @@ class MDSBackup
      */
     public function __construct($file = '')
     {
-        if ($file == '') {
-            $file = getcwd();
+        if ($file === '') {
+            $file = @is_writable('/var/imunify360/tmp') ? '/var/imunify360/tmp' : getcwd();
             $file .= '/mds_backup_' . time() . '.csv';
         }
         $this->fhandle = fopen($file, 'a');
@@ -3017,6 +3161,7 @@ class MDSBackup
         ftruncate($this->hmemory, 0);
     }
 }
+
 class MDSCleanup
 {
     public static function clean($entry, $clean_db, $connection, $query, $field, $key, $report = null, $table_config = null)
@@ -3028,8 +3173,8 @@ class MDSCleanup
             if ($entry->getB64decodedContent() !== null) {
                 $c = base64_encode($c);
             }
-            $query_str = 'UPDATE `' . $query->getDb() . '`.`' . $query->getTable() . '` SET `' . $field . '`=\'' . $connection->real_escape_string($c) . '\'';
-            $query_str .= ' WHERE `' . $query->getKey() . '`=' . $key . ' AND `' . $field . '`=\'' . $connection->real_escape_string($old_content) . '\';';
+            $query_str = 'UPDATE `' . $query->getDb() . '`.`' . $query->getTable() . '` SET `' . $field . '`=UNHEX(\'' . bin2hex($c) . '\')';
+            $query_str .= ' WHERE `' . $query->getKey() . '`=' . $key . ' AND `' . $field . '`=UNHEX(\'' . bin2hex($old_content) . '\');';
             if ($connection->query($query_str) && $connection->affected_rows === 1 && $old_content !== $c) {
                 return $clean_result;
             }
@@ -3100,7 +3245,7 @@ class MDSRestore
             $progress->setCurrentTable(0, '');
         }
 
-        $this->start_time = microtime(true);
+        $this->start_time = AibolitHelpers::currentTime();
     }
 
     /**
@@ -3183,7 +3328,7 @@ class MDSRestore
         fclose($this->fhandle);
         if (isset($this->report)) {
             $this->report->setCountTablesScanned(1);
-            $this->report->setRunningTime(microtime(true) - $this->start_time);
+            $this->report->setRunningTime(AibolitHelpers::currentTime() - $this->start_time);
         }
     }
 
@@ -3405,6 +3550,8 @@ class MDSErrors
     const MDS_CMS_CONFIG_NOTSUP         = 17;
     const MDS_MULTIPLE_DBS              = 18;
     const MDS_NO_SCANNED                = 19;
+    const MDS_NO_REPORT                 = 20;
+    const MDS_NO_BACKUP                 = 21;
 
     const MDS_CLEANUP_ERROR             = 101;
     const MDS_RESTORE_UPDATE_ERROR      = 102;
@@ -3431,6 +3578,8 @@ class MDSErrors
         self::MDS_CMS_CONFIG_NOTSUP           => 'Can\'t parse config for CMS: %s',
         self::MDS_MULTIPLE_DBS                => 'For multiple DBs we support only scan, please select one db for work.',
         self::MDS_NO_SCANNED                  => 'No database to process.',
+        self::MDS_NO_REPORT                  =>  'No --report-file option specified',
+        self::MDS_NO_BACKUP                  =>  'No --backup-file option specified',
     ];
 
     public static function getErrorMessage($errcode, ...$args) {
@@ -3438,6 +3587,7 @@ class MDSErrors
     }
 
 }
+
 class MDSException extends Exception
 {
     private $_errcode = 0;
@@ -3520,11 +3670,12 @@ class MDSDBCredsFromConfig
     public function printForXArgs()
     {
         foreach ($this->creds as $db_cred) {
-            echo  $db_cred['db_host'] . ';;' . $db_cred['db_port'] . ';;' . $db_cred['db_user'] . ';;' . $db_cred['db_pass'] . ';;' . $db_cred['db_name'] . ';;' . $db_cred['db_prefix'] . PHP_EOL;
+            echo '"\'' . $db_cred['db_host'] . ';;' . $db_cred['db_port'] . ';;' . $db_cred['db_user'] . ';;' . $db_cred['db_pass'] . ';;' . $db_cred['db_name'] . ';;' . $db_cred['db_prefix'] . '\'"' . PHP_EOL;
         }
     }
 
 }
+
 class MDSCMSConfigFilter
 {
     private $followSymlink = true;
@@ -3556,8 +3707,7 @@ class MDSCMSConfigFilter
     }
 
 }
-
-class MDSCHRequest
+class SendMessageRequest
 {
 
     const API_URL = 'https://api.imunify360.com/api/send-message';
@@ -3567,13 +3717,15 @@ class MDSCHRequest
     private $debug = false;
 
     /**
-     * MDSCHRequest constructor.
+     * SendMessageRequest constructor.
+     * @param string $tag
      * @param int $timeout
      */
-    public function __construct($timeout = 10, $debug = false)
+    public function __construct($tag, $timeout = 10, $debug = false)
     {
         $this->timeout = $timeout;
         $this->debug = $debug;
+        $this->tag = $tag;
     }
 
     /**
@@ -3582,7 +3734,6 @@ class MDSCHRequest
      */
     public function request($data)
     {
-        $result = '';
         $json_data = json_encode($data);
 
         try {
@@ -3598,7 +3749,7 @@ class MDSCHRequest
             $result = curl_exec($ch);
             curl_close($ch);
         } catch (Exception $e) {
-            fwrite(STDERR, 'Warning: [MDS] Curl: ' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, 'Warning: [' . $this->tag . '] Curl: ' . $e->getMessage() . PHP_EOL);
             return false;
         }
         return @json_decode($result, true);
@@ -3609,6 +3760,7 @@ class MDSCHRequest
         return $this->debug ? self::DEBUG_API_URL : self::API_URL;
     }
 }
+
 class MDSSendToCH
 {
     private $request = null;
@@ -3623,13 +3775,7 @@ class MDSSendToCH
 
     public function prepareData($report)
     {
-        $this->report = $report;
-        $this->array_walk_recursive_delete($this->report, function($value, $key, $userdata) {
-            if ($key === 'row_ids' || $key === 'rows_with_error') {
-                return true;
-            }
-            return false;
-        });
+        $this->report = MDSJSONReport::removeKeysFromReport($report, ['row_ids', 'rows_with_error']);
         $this->report = ['items' => [$this->report]];
     }
 
@@ -3650,28 +3796,8 @@ class MDSSendToCH
             return false;
         }
     }
-
-    /**
-     * Remove any elements where the callback returns true
-     *
-     * @param  array    $array    the array to walk
-     * @param  callable $callback callback takes ($value, $key, $userdata)
-     * @param  mixed    $userdata additional data passed to the callback.
-     * @return array
-     */
-    private function array_walk_recursive_delete(array &$array, callable $callback, $userdata = null)
-    {
-        foreach ($array as $key => &$value) {
-            if (is_array($value)) {
-                $value = $this->array_walk_recursive_delete($value, $callback, $userdata);
-            }
-            if ($callback($value, $key, $userdata)) {
-                unset($array[$key]);
-            }
-        }
-        return $array;
-    }
 }
+
 
 class MDSDetachedMode
 {
@@ -3707,11 +3833,11 @@ class MDSDetachedMode
 
     protected function checkWorkDir($workdir)
     {
-        if (!file_exists($workdir) && !mkdir($workdir) && !is_dir($workdir)) {
+        if (!file_exists($workdir) && !mkdir($workdir, 0750) && !is_dir($workdir)) {
             die('Error! Cannot create workdir ' . $workdir . ' for detached scan.');
         } elseif (file_exists($workdir) && !is_writable($workdir)) {
             die('Error! Workdir ' . $workdir . ' is not writable.');
-        } 
+        }
     }
 
     protected function savePid()
@@ -3759,6 +3885,8 @@ class MDSDetachedMode
 
 class MDSDBCredsFromAVD
 {
+    const BUSY_TIMEOUT_MSEC = 10000;
+
     protected $dbh;
 
     protected $avd_path_prev    = '/var/imunify360/components_versions.sqlite3';
@@ -3792,7 +3920,9 @@ class MDSDBCredsFromAVD
                 $res['app_owner_uid'] = $row['app_uid'] ?? null;
                 yield $res;
             } catch (MDSException $ex) {
-                $res['error'] = $ex;
+                $res = [
+                    'error' => $ex,
+                ];
                 yield $res;
             }
         }
@@ -3806,7 +3936,7 @@ class MDSDBCredsFromAVD
 
     public function countApps($paths, $apps = null, $glob = false)
     {
-        list($sql, $params) = $this->generateAppDBQuery($glob, $apps, $paths);
+        list($sql, $params) = $this->generateAppDBQuery($glob, $apps, $paths, true);
         $count_sql = 'SELECT COUNT(*) as count FROM (' . $sql . ');';
         $result = $this->execQueryToAppDB($count_sql, $params);
         $this->found_apps = (int)$result->fetchArray(SQLITE3_NUM)[0];
@@ -3826,6 +3956,8 @@ class MDSDBCredsFromAVD
     private function openAppDB($db)
     {
         $this->dbh = new \SQLite3($db);
+        $this->dbh->busyTimeout(self::BUSY_TIMEOUT_MSEC);
+        $this->dbh->exec('PRAGMA journal_mode = WAL;');
     }
 
     private function haveColumn($table_name, $column_name)
@@ -3873,11 +4005,10 @@ class MDSDBCredsFromAVD
      *
      * @return array
      */
-    private function generateAppDBQuery($glob, $apps, $paths): array
+    private function generateAppDBQuery($glob, $apps, $paths, $only_ids = false): array
     {
         $params = [];
-
-        $sql = 'SELECT *'
+        $sql = 'SELECT max(id)'
             . ' FROM apps'
             . ' WHERE (';
         for ($i = 0, $iMax = count($paths); $i < $iMax; $i++) {
@@ -3903,7 +4034,11 @@ class MDSDBCredsFromAVD
         $sql .= isset($apps) ? ')' : '';
         $sql .= ' GROUP BY ' . $this->path_field . ', title';
 
-        return [$sql, $params];
+        $final_sql = $sql;
+        if (!$only_ids) {
+            $final_sql = 'SELECT * FROM apps WHERE id IN (' . $sql . ') ORDER BY id';
+        }
+        return [$final_sql, $params];
     }
 
 }
@@ -4070,7 +4205,7 @@ class MDSSendUrls
             'source'    => 'MDS',
         ];
         $res = $this->request->request($data);
-        if ($res['status'] === 'ok') {
+        if ($res !== null && $res['status'] === 'ok') {
             return true;
         } else {
             fwrite(STDERR, 'Warning: [MDS] Invalid response: ' . json_encode($res) . PHP_EOL);
@@ -4078,6 +4213,7 @@ class MDSSendUrls
         }
     }
 }
+
 
 class MDSWpcoreConfig extends MDSCMSAddon
 {
@@ -4184,10 +4320,19 @@ class MDSProcessingList
             }
         }
         unset($v);
-        foreach ($data as $k => $v) {
+        $fields_data = [];
+        foreach ($query->getFieldsData() as $field) {
+            $k = $query->getAliasByField($field);
+            $v = $data[$k];
+            $fields_data[$field][] = $v;
+        }
+        foreach ($query->getFields() as $field) {
+            $k = $query->getAliasByField($field);
+            $v = $data[$k];
             $this->entries[] = new MDSEntry(
                 $key,
                 $query->getFieldByAlias($k),
+                $fields_data,
                 $k,
                 $v,
                 (isset($fields[$k]) && $fields[$k] === true)
@@ -4442,6 +4587,12 @@ class MDSEntry
     private $content;
 
     /**
+     * additional fields data
+     * @var array
+     */
+    private $field_data = [];
+
+    /**
      * content of row base64 decoded if needed
      * @var string|null
      */
@@ -4465,13 +4616,14 @@ class MDSEntry
      */
     private $clean_ref;
 
-    public function __construct(int $key, string $field, string $alias, string $content, bool $base64)
+    public function __construct(int $key, string $field, array $field_data, string $alias, string $content, bool $base64)
     {
         $this->key = $key;
         $this->alias = $alias;
         $this->field = $field;
-        $this->content = $content;
-        $this->b64decoded_content = $base64 ? base64_decode($content) : null;
+        $this->field_data = $field_data;
+        $this->content = hex2bin($content);
+        $this->b64decoded_content = $base64 ? base64_decode(hex2bin($content)) : null;
     }
 
     /**
@@ -4481,6 +4633,15 @@ class MDSEntry
     public function getField()
     {
         return $this->field;
+    }
+
+    /**
+     * Get array of additional data fields
+     * @return array
+     */
+    public function getFieldsData()
+    {
+        return $this->field_data;
     }
 
     /**
@@ -4937,7 +5098,7 @@ class MDSUnixSocket
             return false;
         }
         $sock = fsockopen('unix://' . $file);
-        stream_set_blocking($sock, false);
+        stream_set_timeout($sock, 2);
         $data = fread($sock, 64);
         fclose($sock);
         $proto = @unpack('C/x/x/x/C', substr($data, 0, 5))[1];
@@ -5002,13 +5163,15 @@ class LoadSignaturesForClean
 {
     private $sig_db             = [];
     private $sig_db_meta_info   = [];
+    private $advanced_signs      = ['-js.', '.phish.'];
+    private $advanced_ids        = [];
     private $sig_db_location    = 'internal';
     private $scan_db            = null;
     public  $_FlexDBShe         = [];
 
     private $deMapper           = '';
 
-    public function __construct($signature, $avdb)
+    public function __construct($signature, $avdb, $full = true)
     {
 
         $this->sig_db_meta_info = [
@@ -5028,7 +5191,9 @@ class LoadSignaturesForClean
             InternalCleanSignatures::init();
             $db_raw = explode("\n", base64_decode(strrev(str_rot13(gzinflate(base64_decode(InternalCleanSignatures::$db))))));
         }
-        
+
+        $fatal = false;
+
         foreach ($db_raw as $line) {
             $line = trim($line);
             if ($line == '') {
@@ -5062,18 +5227,35 @@ class LoadSignaturesForClean
                 $db_item['sig_match']   = str_replace('@<q>@', '[\'"]{0,1}', $db_item['sig_match']);
                 $db_item['sig_replace'] = trim(@$parsed[4]);
 
-                if ($db_item['sig_match'] == '') {
+                if ($db_item['sig_match'] === '') {
                     throw new Exception($line);
                 }
 
-                $this->sig_db[] = $db_item;
                 $this->_FlexDBShe[] = $db_item['sig_match'];  //rescan signs
+                if (!$full && $this->needSkip($db_item['id'])) {
+                    $this->advanced_ids[] = AibolitHelpers::myCheckSum($db_item['sig_match']);
+                    continue;
+                }
+                $this->sig_db[] = $db_item;
+                if (preg_match('~' . $db_item['mask_type'] . '~smi', 'Lorem ipsum') === false) {
+                    echo $db_item['mask_type'] . "\n";
+                    $fatal = true;
+                }
+
+                if (preg_match('~' . $db_item['sig_match'] . '~smi', 'Lorem ipsum') === false) {
+                    echo $db_item['sig_match'] . "\n";
+                    $fatal = true;
+                }
             }
+        }
+
+        if ($fatal) {
+            throw new Exception("Errors in regexp\n\n");
         }
         LoadSignaturesForScan::optSig($this->_FlexDBShe, false, 'AibolitHelpers::myCheckSum');
         $this->deMapper = @unserialize(@base64_decode($this->deMapper));
     }
-    
+
     public function getDBLocation()
     {
         return $this->sig_db_location;
@@ -5083,7 +5265,7 @@ class LoadSignaturesForClean
     {
         return $this->sig_db;
     }
-    
+
     public function getDBMetaInfo()
     {
         return $this->sig_db_meta_info;
@@ -5103,6 +5285,19 @@ class LoadSignaturesForClean
     {
         $this->scan_db = $db;
     }
+
+    public function needSkipId($id) {
+        return in_array($id, $this->advanced_ids);
+    }
+
+    private function needSkip($name) {
+        foreach ($this->advanced_signs as $pat) {
+            if (strpos($name, $pat) !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 class InternalCleanSignatures
@@ -5111,7 +5306,7 @@ class InternalCleanSignatures
 
     public static function init()
     {
-        $i000101010010110010 = '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'; //This variable will be filled by the building script.
+        $i000101010010110010 = '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'; //This variable will be filled by the building script.
         self::$db = $i000101010010110010;
     }
 }
@@ -5640,6 +5835,7 @@ class LoadSignaturesForScan
     }
 }
 
+
 class InternalSignatures
 {
     public static $_DBShe;
@@ -5660,22 +5856,22 @@ class InternalSignatures
 
     public static function init()
     {
-        //BEGIN_SIG 14/12/2021 08:24:01
-self::$_DBShe = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$X_DBShe = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$_FlexDBShe = unserialize(gzinflate(/*1639502641*/base64_decode("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")));
-self::$X_FlexDBShe = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$XX_FlexDBShe = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$_ExceptFlex = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$_AdwareSig = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$_PhishingSig = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$_JSVirSig = unserialize(gzinflate(/*1639502641*/base64_decode("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")));
-self::$X_JSVirSig = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$_SusDB = unserialize(gzinflate(/*1639502641*/base64_decode("HUu7DsIwEPuXTKRDQiuV4QJ0YOEHmAhDaSM4Kb1ESWkG4N+5Ivkh23IPDbwRtiZDW4PY5yFhnI82V0uf7LOakNzqBya5wnoKSGdcnFWXzNNdGISa77sWBGi96aCUYpXsrk25cWLQy3s3fkIaY3I5R6SHtGoI01r5f2cVuVlqYb4/")));
-self::$_SusDBPrio = unserialize(gzinflate(/*1639502641*/base64_decode("S7QysKquBQA=")));
-self::$_Mnemo = unserialize(gzinflate(/*1639502641*/base64_decode("fVzLkh05bv2X3lcFSZAgqFlNeGVH2JsOh9d8jqpbj7JU454Jh//dyLw3yWSC2dopxHP5Ag4OQKTiJ6vVp//9+Yk+/WLRqhQRf/nLz0/Gfvrl13//r5d//Y9/e1FgtXl5//z+mn4vP15g+3ceXkKsLWazD6fzcAfw8vbtt9evX/54QMwT4lykRBR2iD9DEEyHfE/txf7yl7dP5DQqo5BHg5pGk3n5/PH1y+vP9/j19cvbt99f9DFFcD7qFvcpwgzCvonXt2/5S8eobMF52Fc5T+SVH5g/fn7+8uXFPUEZ0ZENUe7FB5j2cuw+WYCGscgDI0c3B8a/Vn1rEhKUmSHHZnQJmY9gXxecD8AarS6bef3+rfLp1R8v/rjUmgyhsfuEbkK755n/qOWtz1Y0aQpB7ePxPB6sf9kW99tPPuzf+o54OOWW8g4wM4BeroPRVootLAY7fQxWz8FQDdbiH78Mp8EOfD/evnCrk6rZh9XoIEaTN4UvG+RoZ3QffXiGy5k0ZiVHo0b52+ANJbDCkBw6PRnSsdPobQwu7ZYIekLgcNTX+vZRf348XAktBELl5Bykpjm6H9mAKmZp3oygpXnHmJO3liTCIy33oWPSOjwJZ0Z4XCJqib7Cw7jnk/WnOz5GF+8zEZXF6ODFPZgQVW7ayNWQ8muHjjEG0IvfJwdiNYaPx2PdfRkuo8dud0bbXazPooJuLmrBAUx1euaAYyoVoimpLCG4hpCpRofmFhA8ceC2/cPMq3VBxyebz5Bg13xWYwmlaRRMixw1rkyrhzs1Za0XF4MquKWZeFBQ2bvFylCzmWzT7Me8QQ46D9VVh0XaO2pa26KzJaKNdYVY2ws4y1RU5RnjRs1MZ4vLd2TYfZKIyWjMYPMRLzw079Ji48ba+RYPiEroXMsgITCcZJ6lGEXolAzjaE1YnpWiaFPBJCexYNYGGRIFX2K+QjSf7mMrH9+/f3lN3z9GSLaEHp+7P3mYNspIdiBoYBoIFtXGmBHAn7cy4gaQKVEnOYdBPO7wxR77tqEVjCJ+awN4s+9ITmlq5hpRGRLwtKwOyFhSjiZIgNW0h+ANxIBuJJnYbCNcnZAB/tYJc21GVaPkTuwpgvzt+8f3DkFApiHvrmaijQO9DDqhJO+8ygvETUBAHVujsjhgR/rQH193iXNMwhGEryXgCuJmHzkMyznv1CHDpnWhMst1kWm6Ft3kGaMZXvU1vn2p4+obxVwyCH7YQHTjJdo1XaJarAzscmWmZZZ4WTjvhhgrq99yRyQqLnojJPWGGMt6mEvHQFG8k3LlrQ0TBm910cqHa6nRYgoL40528zp8q5jEHJEFp2hD3k3xdFB2wYDkvHQVWvsWBxJEesbeaV1B65utY0MCC/ka5xkT6GRfh/TGY66ICVQT3K1B67s4D4qvv0ZBYUActEaGNLuybew0ueznCOdTsJrj9o7aqfVH/fr9o75+fH3v1IEtsylWFOzH6YHv7HeMtiwuG08lTo9HU493f/xgnTqCPSleey4SsyUUY0s/6/fhN0iskIyQO9p6DhXLuFqaLQ0WxmOJyX+C9CzRcSoWqqQaS/4G4g3GmqvI+LTTXq8XpjzqzNpN7N9xyLjMYsdmtNJBcrNjRp8xdPAGR96crDQ2hoT1ZpyJLGCltmCIu1EvCppSLN0kxDp5ZG9sjSpYBLiSpnN27P2t/Yhfa5/DU4ypRZJzuBGQX/P3t28j4yqOqdmTsGK3RYBrxC/ZRHYyL29kY+XZIg9pbI1t7JmLs/LqYpEHRDNrsDiU4oUhKBYVkuP0LC5OlnPmPkH58f6j8yWaGoN/iGI4U7IL9un2ZSvo1OOEu8Cw2hdAkVhrVMPw+zTJWMXRoq5G95X1Xavmqk/OLkaTEYSiVSstyRRfo1ZKjC6cHxnnFithbxGjk2+VM2SRhm+jOcbvR3K5g0qa0xJ5Y6gBxI3VZI2pWhQceLSVa8+G83ulHr/t5tF2GF3/9RQ1+JKlSfN4adI6c1JTaLVyS/KOkF1Ax9U5OrlyyJ7AyFLJNnqcyqGsOKHn8GqkGNsztTUP58rG7ySpMiSseUinomJwolTJELpQlx2Xm2qNXgg41Jx0Dq+flhZyzpz8Si5iEK6XZrI2HFeSnIf1/pXz+m0ncIaSJHxke79h7xiq1kWkeQzxN0eQaiFqstiimaFJ2FTWRYNTVdAkWmUuazqYxVqX2BelSuZEEq6HfJQoiRNJDE8NMk9E8FLfcvzx+vHz4/VrGSmPLR6CRhm7Ea983Gk/YXHKyVwE0Yy73MRRLyBVx9Zc6mISuByx2qJd0ICcy4I43q0YfhxvTygaxyaSVSAOG+6qC45Ep0Ew0Ui25IBihd+yDRrWKlFM4E9sNk8AaaveLcI7Q25OFSGCMqkJBc6QsY1YRlXXFlMCSVNngF/PoRurG2qycuDNVXX00/VoEmhJcf6kVEdWkKMDepjtZIHe0FUR9MvgpJtcW2BAuxuMsRwclawXadaINyKtpJpzW5Cjx6sU7OE9Vw/eSins8Uom/VJasIbDwgJCbs1zIauWNSzu0V/vsVf/XaJWF7k9q3q13j6LLh+ykS7IEL3eC2dQ1JQsEjPESTdkiagCZwFyArr6eDdH2gouj0o6uAlyDuXbze9PWT8HMqhiSxUFVkZew8lgVBM4FShCN/igTunTqOEmVql8zILlfNC74e+Z4M/3fw7jby1HU4w8r2CkqqolBTAepNkHezb7v9VvIxGGxHGsSU3gwzWd6zk3AJN/k6UmH2jIiM23etxFjJ4TATEJKXURHuEwLqBgvXPibEmZ015GpYXTPCxNqg5S1xxrFD1dVcy3u62YM0Rr9dTorOlf849/vn+MBNhAYfGzYDwCfWMozPTegZbcTUA3RIGxBEULdUOsbGfIcZXYqAT+I4yFTX9Ix05eUKgGQnnA1pvFAVvFmUZEKXp5PAhT5NS9+BCkotsKrlel1adIqFLSkoPI6RtC0YGqwyRFDblHVNzLka/589v/DEVXlbNUq0wYyQ0W4rv/YziiZb2Vm1mYF+KNCCyWbz2RpHrCq9rutZWKnsMWCM9i5TJ7Vg8OpWHUaafIqShF9Nj/g1J+f/v6tY43BQ4DBQPJajyjnECNqOqgYRDvSYw61SQud1qAI4RRsmZKFPxyS766kIKSJQAmBLgJ3sjyTtUkeZI9aJGR6QgmJvGYxCFAm4mH+9YVgI9JvNQzAlYZIrDHq1wkR4TtaWh59xWUVu7xajOxUQAMkzzfCoVjL7awwaDk7wD+Rh049MhEIcNqgGtOd0Qu44v1GRYQq25mIUDr8FnIsBPEqf4seOptqMGrLCU3RwG1XpSumkq0MrEOJ7oYbG+D8w33v8JltJ+c/pJmcqRNxYUVjha4Xv5uvsUSJckEB9cU7bBi9svU1MJqHNwwRoAYMj08eXKWsFXXhtXEMursbTP/9iiUzpaG2txbWvCmsqre/zpVsgOaME8loBUix2GZDweEG2I3juONIZkhBbymOz0WmMZ5ipYpWEAnU2jLq065yoe5gMFf0+HupJx1FP0k6KdR//rXF8W5qx/ZcPeBVqvjnMJehnPIRLNgjaBj5VgmZYKxcPMkpTxii2ERl+zdKzchS/2y6jzjqDhei47iNeflfmvYup7q1l8jO30IbUkuiS4T3oKd+1J6Ucptz6OPjGh+Gd56X/oLztOiOiGBcTbmxbuiN5emi17KMlqbiNKRWTGPJ5/tqObQTyoUq6I0XhP8eMP7+/uXMuo/WiUNbWG8hi4S8TgGqynBwbDslP9yHLM1tLvI9Jqu7fZM2FaD4To42kpateUv2+vgZE1Lh3HMg8N5GW+fPLDVs1xYDHTXX3Uem0+tS6Hz4JtSnaMQCqeLK8hN4VGxqaY03poHBNRNumg4sHnlo9wuKDh63nohkHMShbg4SHg8Gpwb5JRh5YHP3HAe/HDM8y9zWqgoQ1ms/Cp8e82aoHqE/uZ7huwrf//+/vf3sRzOc7R/ZmA4D9+NoP7j/Y0nODVQMQHnutqsxuv60RJRTAt7BE3Xk4ng+BKrWm32Rn5U4qXo57PT/PtGXX+/lQSh0sJy4Jo5dWrADAgrqwdjr7+vFWetLAiPkHsejF09zm0QpXDaeno0PGNuCjIeasEcVmsC0Y7Z6nbSzz6DeU3Plp/RmTEe5tSW4/fU6YwZlbtY/og/xgOgZdYNpqwcBsRJxa0B1z3d/jLYXwdnG9FgXV0b3Dg852PJlxQXkLuaFatyYrdZzXKtWXVa0U0rnVe7sOa6C8i5KFQ9Sz4PHmXgo+gfjYtYfG8/Oo/GVUOvcYSteWlHDsJhFPvqT90ejcNrzlWsyLnRtDJ4olnwukpDcmhG883DkjoVoaFijVth4AYTFauWo0dtWpXXvcOpnxMVjoxNu8XooMUeOFeP1VmzGh3kaIs+Uq7ySEnDurOlFc5pS5KX7Mg4IYki2xtmjIvRfiy+qzNr2L1KECbhyNvTDY+fLx5t9L1hcwDCqbni3PiFnOeRzjLauIC09gG+AB/yIxrD2QdQ63PvyyX5r7pZhCfVny0DzbPve9vQjGnV1AqjojEwdhzuhpsrbM7HDKM99oS6Pjqe8pkUG4mL15s8n/TgaW20LU94B0NQXfYz+jctO1oigTFbF+6MGW8RyjR6PL2fqZkxbjSaXUDK5+zboxw/g7S6BUHKnDOlcD3trcMSbk/bcJpqSxa8xSj2sFMXZO/NqaV69yi1bvWTAdiKGxvg/fPbz8/d4bPPldPuKCeAYFcTbGkh6ipsmvOOa9Dv1fIQt6MBOcdsaMOaE8u/9Hz2nwEurAANdWJ/XuzCnhpSTwC+CKdKVisArADWboL3+aI/A55d4ddkwLPJKyPoRRs39eGO6MfB0j3LxLOBoL83EIJmNT7rX9M0SA/UxeudCbGmIkI5A04f+DBosHDkdDmouNgKnjriTzbCsRNaIy8BXunzYXXBXy2if7QunVlvSzLNKTT88/Vr/NvYC9H2zh6s3Is/dWzPlR+0qaTWP1c4Qaw+n/Ll2DQnmqbYuMKNdFsWtVjhcbL/zAnno7DhEB71Hx+nC9XV+4fdzOTi/RCwF3LxIWYXlFqsjsyf7CqAapqD4woHf4LLaesELrhYJLkrA46mXmSPoNXRE/7JZJ44By9SSTIu4NwMPVqOU6JSRRKmOcXXq+Zx3CpUKiz4gAyuTLxtOQiaBZ2TN/d0vjVAlWfdaQpR9FCVp4ymhzUVWIk+P+M7Hxswu5z2crUJVwqyZtfijjjhVucV/vzvL0MtukQ+ViE/NlCQ8uOoqRhOi1SISRwfZ9XmLK9HU8n27GkkC8Ft/wNA5JgXnVyafkr45zk8VHlvkgq4Ffv7V2sn2CjbDxtlGuKUSYZ2MEHd1SptbqXphYiArbZxA+KsgE0rSKuGZ7KzqImGCPb07cgZAuvQy4nh9nGUlF7AQfymaaRyuppHsf8EGSW1kSe1nDkESYEC9vTqFIeKtoYap1ZWOA6wmz8O6/SdRr8X3xyyk4p9sH6TTUgPewmkclPS/q1Wou12KPZGWWWR9jHo7jkJQuNrfrzrT3ZpN7u8V+yGqbAVWMCckrCjQEPBxVZHz98JRjdmA75Zz2pHXCirr57vj6+NvAquopXrMrhYV/8kKCoieBzcdK0WLq1omzH0WqwBToV0kZPBcQg7I14OwYWtybvJuG8Bb175OdOJ7KIyYlmg22dyRdsHmCuQnbol9yp277hN3qF6muqZ462bXm/Or6rbBw98sXmBmYxhw/Q+RvKtFC01k+UEdi/nLw+iqEbOVclwrMD0law6jVR0xT4+Ip3nQtJ/YuM+t0xFEqOdX3728+tapoDPabwCDJC/firQw6ppCYNesEO4a/LLkZPw+GjAAztB8Hm1e6L0+sf7NSOrgS8lS0PfcvoTcJrO5u1dJq9WiDdNMx6MbirKAOH09cOELtQLp7LPz9yna2LI7BdTh2dw3uRcJYMxjMSXM0MCGY3OBRlbnHE3mWBMrnkdRCWUIUh3xpeomeDGh1onkL+2KfS3LhV18lk6h4MJc+1ADliYWUiuD7y9rq8fX3QO0viMboDsqTnx7VsebTHgma+fX1jPiHN/xwkRbKFIj9LWvB/rFg54HINXrWgXJL8yzNwHmeqUSko1ETHY8Mf3UF3LlUDhaLG9jA5idNGBMw6SEdaJ1qPuq8GwQFYLT3D6xr0TFEjopL5kyM07GGLjux+NVCeI0Vey6mIphNBMgsXejRXqkhksO19lPHFbaLiRJCGkEO2zee7MVA6ndW2Nlp/fyinTZ12q0jMkT7ORumV6lsrRPT+HAjeDwuUULk1xubEb1AUd0LX1oIc9X5AWLxEb5EbMeITEJCJVnaMT6VziEG45AoTehtRBeO6KnL6CpxxKCV6sDDXdNFtXsorqIgihuVL8cWQlEhPO81OE82Ej4KrZSatCNmlJ1GjVn4Rhw5IyKZCGgFbfNmBAoqQLSNZFDqo3MoZZUrXUJH0iwhmzRZOR31q2Yx2WIHsHUpCCJy/vxyt1kz+2WJMrWTxaa2/ujM3mkFnYojgDb8QZjO4yXkJJchpS9ka+QKbochUldTa16+taL0dFG+joRjpDgnI3PfQ6lmqrndKAvaNmI1H5vb6zugSY3uIeo83j6/vzO0cixz8cJl7bum9Y3bt98D/e37Z37y/f3z6G87sMuagpbO4g6x7/xQ6f74U+Q0ycVqJABFCjtL1VaXogA858vL/umRH4KG7vv3804NgKZmty3UfjGM1+DecvCYeWzkFHqJPU3wHaCHnbH3iCNU1hFJNoUNMkPfptX3WSD9fDtXC0Zz+/b9yazbvC0MzjFptYGczqdsN0lgxOGchWYNxUxZh2o6v1SKYuMNdoMeapOYWQpzrgA2PsNcJsMrWfdmLvzc/GxWkuI5KxbjKxtGa8X2DwDpNzKaTbVGbZMWTuPmlRJejGElFMw6nW3TSBIkeLKJfGSecV0+3ZbJ+E2ygx/nY7yWEutkpTCHA97lMbPZZsn4Z98jSnrh/CjC6cnJjk9dVKnZl95zX/fbyYM1lxrhzFsbmtzefG4iwvqz7/a4wj/9oxYcpEL55qbMlkTbnOxOH8T6SQjfDMO84zoT/sYM+KnjP1fnxE5XWaHmQ24rTg1h3PWifTfM7XpRllhAv1doaQWnTor6fNMgAFJxwgjg0plYLCEDiU3CXjOenM/wzSf9QtptqmM2UlMfp+Q6RrTdZJjLnlHutjQ8jSGdz9fpQroeW4EAEIN5adgZOv0iZfOJ4GoNedn/+732MSHVI1xp8N5yhxelHiPHw7eq2cMdM3Gb/+56/7N0sjpO9f/B8QMJgalOkr2x1CyMLua/2ID1CLv+/x5P/+Hw==")));
+        //BEGIN_SIG 21/06/2022 03:39:48
+self::$_DBShe = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$X_DBShe = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$_FlexDBShe = unserialize(gzinflate(/*1655815188*/base64_decode("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")));
+self::$X_FlexDBShe = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$XX_FlexDBShe = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$_ExceptFlex = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$_AdwareSig = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$_PhishingSig = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$_JSVirSig = unserialize(gzinflate(/*1655815188*/base64_decode("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")));
+self::$X_JSVirSig = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$_SusDB = unserialize(gzinflate(/*1655815188*/base64_decode("JU7LroIwEP2XbhQftMjFyCCYGzf+gCvKokKjNVhIW6m56r87XJN5ZM7MOXMExPBUwDILSQRka2ujeldwOxuE4ZfZTWk59hxTS4913yl9UIPk4dHi6kQyBRHS1wkQoHS6A+89D4NdufIVThj63rayeXWm6Y20tlf6HPCw7m4j1P5jPNTSBXQUW6HYJkYv06+ZAJ9aU5f8klfzckKqRjgBTj4cvYpBfI+yk7By/bMof5d/bJlWzzRNFzFj7J3nI6fYUh4VJHt/AA==")));
+self::$_SusDBPrio = unserialize(gzinflate(/*1655815188*/base64_decode("S7QysKquBQA=")));
+self::$_Mnemo = unserialize(gzinflate(/*1655815188*/base64_decode("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")));
 self::$_DeMapper = unserialize(base64_decode("YTo1OntzOjEwOiJ3aXphcmQucGhwIjtzOjM3OiJjbGFzcyBXZWxjb21lU3RlcCBleHRlbmRzIENXaXphcmRTdGVwIjtzOjE3OiJ1cGRhdGVfY2xpZW50LnBocCI7czozNzoieyBDVXBkYXRlQ2xpZW50OjpBZGRNZXNzYWdlMkxvZygiZXhlYyI7czoxMToiaW5jbHVkZS5waHAiO3M6NDg6IkdMT0JBTFNbIlVTRVIiXS0+SXNBdXRob3JpemVkKCkgJiYgJGFyQXV0aFJlc3VsdCI7czo5OiJzdGFydC5waHAiO3M6NjA6IkJYX1JPT1QuJy9tb2R1bGVzL21haW4vY2xhc3Nlcy9nZW5lcmFsL3VwZGF0ZV9kYl91cGRhdGVyLnBocCI7czoxMDoiaGVscGVyLnBocCI7czo1ODoiSlBsdWdpbkhlbHBlcjo6Z2V0UGx1Z2luKCJzeXN0ZW0iLCJvbmVjbGlja2NoZWNrb3V0X3ZtMyIpOyI7fQ=="));
-self::$db_meta_info = unserialize(base64_decode("YTozOntzOjEwOiJidWlsZC1kYXRlIjtzOjEwOiIxNjM5NDY3OTUzIjtzOjc6InZlcnNpb24iO3M6MTM6IjIwMjExMjE0LTcwMzgiO3M6MTI6InJlbGVhc2UtdHlwZSI7czoxMDoicHJvZHVjdGlvbiI7fQ=="));
+self::$db_meta_info = unserialize(base64_decode("YTozOntzOjEwOiJidWlsZC1kYXRlIjtzOjEwOiIxNjU1Nzk3MTM5IjtzOjc6InZlcnNpb24iO3M6MTM6IjIwMjIwNjIxLTgxODciO3M6MTI6InJlbGVhc2UtdHlwZSI7czoxMDoicHJvZHVjdGlvbiI7fQ=="));
 
 //END_SIG
     }
@@ -5753,7 +5949,7 @@ class AibolitHelpers
             case 'k':
                 $val *= 1024;
         }
-        return intval($val);
+        return (int)$val;
     }
 
     /**
@@ -5780,13 +5976,24 @@ class AibolitHelpers
         return htmlspecialchars($par_Str, ENT_SUBSTITUTE | ENT_QUOTES);
     }
 
-
     public static function myCheckSum($str)
     {
         return hash('crc32b', $str);
     }
 
+    /**
+     * Wrapper for the hrtime() or microtime() functions
+     * (depending on the PHP version, one of the two is used)
+     *
+     * @return float|mixed UNIX timestamp
+     */
+    public static function currentTime()
+    {
+        return function_exists('hrtime') ? hrtime(true) / 1e9 : microtime(true);
+    }
+
 }
+
 
 class Finder
 {
@@ -5959,7 +6166,7 @@ class Finder
 
     public function find($target)
     {
-        $started = microtime(true);
+        $started = AibolitHelpers::currentTime();
 
         if ($target === '/') {
             $target = '/*';
@@ -5986,8 +6193,8 @@ class Finder
             yield from $this->expandPath($path, $this->filter->isFollowSymlink());
         }
 
-        if (class_exists('PerfomanceStats')) {
-            PerfomanceStats::addPerfomanceItem(PerfomanceStats::FINDER_STAT, microtime(true) - $started);
+        if (class_exists('PerformanceStats')) {
+            PerformanceStats::addPerformanceItem(PerformanceStats::FINDER_STAT, AibolitHelpers::currentTime() - $started);
         }
     }
 
@@ -6066,6 +6273,7 @@ class Finder
         return $this->filter;
     }
 }
+
 class StringToStreamWrapper {
 
     const WRAPPER_NAME = 'var';
@@ -6220,9 +6428,26 @@ class Normalization
             }
         }, $string);
 
+        $string = preg_replace_callback('/\\\\(?:x(?<hex>[a-fA-F0-9]{1,2})|(?<oct>[0-9]{2,3}))/i', function($m) use ($save_length) {
+            $is_oct     = isset($m['oct']);
+            $full_str   = $m[0];
+            $value      = $is_oct ? $m['oct'] : $m['hex'];
+            if ($save_length) {
+                if ($is_oct) {
+                    return str_pad(@chr(octdec($value)), strlen($full_str), ' ');
+                }
+                return str_pad(chr(@hexdec($value)), strlen($full_str), ' ');
+            } else {
+                if ($is_oct) {
+                    return @chr(octdec($value));
+                }
+                return @chr(hexdec($value));
+            }
+        }, $string);
+
         $pattern = '~%([0-9a-fA-F]{2})~';
         if ($save_length && preg_match('~%25(%[0-9a-fA-F]{2}){2}(%25)?~ms', $string)) {
-            $pattern = (isset($m[2]) && $m[2] !== '') ? '~%\s{0,2}([0-9a-fA-F\s]{2,6})~' : '~%\s{0,2}([0-9a-fA-F]{2})~';
+            $pattern = (isset($m[2]) && $m[2] !== '') ? '~% {0,2}([0-9a-fA-F ]{2,6})~' : '~% {0,2}([0-9a-fA-F]{2})~';
         }
 
         for ($i = 0; $i < 2; $i++) {
@@ -6252,24 +6477,7 @@ class Normalization
             }, $string);
             $iter++;
         }
-        
-        $string = preg_replace_callback('/\\\\(?:x(?<hex>[a-fA-F0-9]{1,2})|(?<oct>[0-9]{2,3}))/i', function($m) use ($save_length) {
-            $is_oct     = isset($m['oct']);
-            $full_str   = $m[0];
-            $value      = $is_oct ? $m['oct'] : $m['hex'];
-            if ($save_length) {
-                if ($is_oct) {
-                    return str_pad(@chr(octdec($value)), strlen($full_str), ' ');
-                }
-                return str_pad(chr(@hexdec($value)), strlen($full_str), ' ');
-            } else {
-                if ($is_oct) {
-                    return @chr(octdec($value));
-                }
-                return @chr(hexdec($value));
-            }
-        }, $string);
-        
+
         $string = self::concatenate_strings($string, $save_length);
 
         $string = preg_replace_callback('~<title[^>]{0,99}>\s*\K(.{0,300}?)(?=<\/title>)~mis', function($m) use ($save_length) {
@@ -6283,6 +6491,8 @@ class Normalization
             return str_pad('<?php', strlen($m[0]), ' ');
         }, $string);
 
+        $string = str_replace(' ', '  ', $string);  //0xc2, 0xa0
+
         if (!$save_length) {
             $string = str_replace('<?php', '<?php ', $string);
             $string = preg_replace('~\s+~msi', ' ', $string);
@@ -6293,7 +6503,7 @@ class Normalization
 
         return $string;
     }
-    
+
     public static function get_end_of_extended_length($string_normalized, $string_orig, $start_pos)
     {
         if (strlen($string_normalized) == $start_pos + 1) {
@@ -6317,6 +6527,7 @@ class Normalization
 
         $string_strip_whitespace = self::strip_whitespace($string, true);
         $needle = self::strip_whitespace($needle, false);
+        $needle = preg_replace('~(?<!\:)//[^?\n]{1,15}(\n?\?>)~msi', '$1', $needle);
 
         $string = preg_replace_callback('~(<%3f|%253c%3f|%3c%3f)(php)?~msi', function ($m) {
             $ret = (isset($m[2]) && $m[2] !== '') ? '<?php' : '<?';
@@ -6329,12 +6540,21 @@ class Normalization
 
         $string = self::normalize($string, true);
         $needle = self::normalize($needle, false);
-        $string = preg_replace_callback('~/\*[^\*]+\*/~', function ($m) {
+        $string = preg_replace_callback('~(?<!\*)/\*[^\*]+\*/~', function ($m) {
             return str_repeat(' ', strlen($m[0]));
         }, $string); //php_strip_whitespace don't strip all comments, from xoredStrings type, hack for this
-        $needle = preg_replace('~/\*[^\*]+\*/~', '', $needle); //php_strip_whitespace don't strip all comments, from xoredStrings type, hack for this
+        $needle = preg_replace('~(?<!\*)/\*(([^\*]|\*(?!\/))*)\*/~msi', '', $needle); //php_strip_whitespace don't strip all comments, from xoredStrings type, hack for this
+        $string = preg_replace_callback('~(?<!\*)  /  \*  (([^\*]|  \*  (?!\/))*)  \*  /~msi', function ($m) {
+            return str_repeat(' ', strlen($m[0]));
+        }, $string);
+        $string = preg_replace_callback('~(?<!\*)/       \*       (([^\*]|       \*       (?!\/))*)\*       /~msi', function ($m) {
+            return str_repeat(' ', strlen($m[0]));
+        }, $string);
 
-        $string = preg_replace_callback('~%\s*([\da-f])\s*([\da-f])~msi', function ($m) {
+        $string = preg_replace_callback('~% *([\da-f]) *([\da-f])~msi', function ($m) {
+            return str_pad(chr(@hexdec($m[1] . $m[2])), strlen($m[0]), ' ');
+        }, $string);
+        $string = preg_replace_callback('~\\\\  x  ([\da-f])  ([\da-f])  ~msi', function ($m) {
             return str_pad(chr(@hexdec($m[1] . $m[2])), strlen($m[0]), ' ');
         }, $string);
 
@@ -6426,10 +6646,12 @@ class Normalization
                 $i++;
             } else if ((trim($string[$i]) === '*' && trim($string[$i + 1]) === '/') && $in_comment_ml) {
                 $in_comment_ml = false;
-                $newStr .= ' ';
+                $newStr .= '  ';
+                $i++;
             } else if ((trim($string[$i]) === '/' && trim($string[$i + 1]) === '/') && !$in_comment_nl && !$in_comment_ml) {
                 $in_comment_nl = true;
-                $newStr .= ' ';
+                $newStr .= '  ';
+                $i++;
             } else if ((trim($string[$i]) === '#') && !$in_comment_nl && !$in_comment_ml) {
                 $in_comment_nl = true;
                 $newStr .= ' ';
@@ -6631,13 +6853,15 @@ class ScanUnit
             }
             $flag = ScanCheckers::{$checker}($l_Unwrapped, $l_pos, $l_SignId, $signs, $debug);
             if ($flag && isset($processResult) && is_callable($processResult)) {
-                $processResult($checker, $l_Unwrapped, $l_pos, $l_SignId, $return);
+                $tag = 'match_o:?,u:1_' . $checker;
+                $processResult($checker, $l_Unwrapped, $l_pos, $l_SignId, $return, $tag);
             }
 
             if (!$flag && $full) {
                 $flag = ScanCheckers::{$checker}($l_Content, $l_pos, $l_SignId, $signs, $debug);
                 if ($flag && isset($processResult) && is_callable($processResult)) {
-                    $processResult($checker, $l_Content, $l_pos, $l_SignId, $return);
+                    $tag = 'match_o:1,u:0_' . $checker;
+                    $processResult($checker, $l_Content, $l_pos, $l_SignId, $return, $tag);
                 }
             }
             if ($flag) {
@@ -6671,13 +6895,24 @@ class ScanUnit
         }
 
         $l_Unwrapped = Normalization::normalize($l_Unwrapped);
-        return self::QCR_ScanContent($checkers, $l_Unwrapped, $content, $signs);
+
+        $getRescanRes = function ($checker, $content, $l_Pos, $l_SigId, &$return) use ($signs) {
+            if ($signs->needSkipId($l_SigId)) {
+                $return = 2;
+            } else {
+                $return = 1;
+            }
+        };
+        $return = 0;
+        self::QCR_ScanContent($checkers, $l_Unwrapped, $content, $signs, null, null, $getRescanRes, $return);
+        return $return;
     }
 }
 
+
 class ScanCheckers
 {
-    const URL_GRAB = '~(?:<(script|iframe|object|embed|img|a)\s*.{0,300}?)?((?:https?:)?\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+\~#=]{2,256}\.[a-z]{2,4}\b(?:[-a-zA-Z0-9@:%_\+.\~#?&/=]*))(.{0,300}?</\1>)?~msi';
+    const URL_GRAB = '~(?:<(script|iframe|object|embed|img|a)\s*[^<]{0,300}?)?((?:https?:)?\\\\?/\\\\?/(?:www\.)?[-a-zA-Z0-9@:%._\+\~#=]{2,256}\.[a-z]{2,10}\b(?:[-a-zA-Z0-9@:%_\+.\~#?&/=\\\\]*))(.{0,300}?</\1>)?~msi';
 
     public static function WarningPHP($l_Content, &$l_Pos, &$l_SigId, $signs, $debug = null)
     {
@@ -6764,13 +6999,13 @@ class ScanCheckers
 
         foreach ($signs->_JSVirSig as $l_Item) {
             $offset = 0;
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_start = microtime(true);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_start = AibolitHelpers::currentTime();
             }
-            $time = microtime(true);
+            $time = AibolitHelpers::currentTime();
             $res = preg_match('~' . $l_Item . '~smi', $l_Content, $l_Found, PREG_OFFSET_CAPTURE, $offset);
-            if (class_exists('PerfomanceStats')) {
-                PerfomanceStats::addPerfomanceItem(PerfomanceStats::PCRE_SCAN_STAT, microtime(true) - $time);
+            if (class_exists('PerformanceStats')) {
+                PerformanceStats::addPerformanceItem(PerformanceStats::PCRE_SCAN_STAT, AibolitHelpers::currentTime() - $time);
             }
             while ($res) {
                 if (!self::CheckException($l_Content, $l_Found, $signs)) {
@@ -6786,16 +7021,16 @@ class ScanCheckers
                 }
 
                 $offset = $l_Found[0][1] + 1;
-                $time = microtime(true);
+                $time = AibolitHelpers::currentTime();
                 $res = preg_match('~' . $l_Item . '~smi', $l_Content, $l_Found, PREG_OFFSET_CAPTURE, $offset);
-                if (class_exists('PerfomanceStats')) {
-                    PerfomanceStats::addPerfomanceItem(PerfomanceStats::PCRE_SCAN_STAT, microtime(true) - $time);
+                if (class_exists('PerformanceStats')) {
+                    PerformanceStats::addPerformanceItem(PerformanceStats::PCRE_SCAN_STAT, AibolitHelpers::currentTime() - $time);
                 }
             }
 
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_stop = microtime(true);
-                $debug->addPerfomanceItem($l_Item, $stat_stop - $stat_start);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_stop = AibolitHelpers::currentTime();
+                $debug->addPerformanceItem($l_Item, $stat_stop - $stat_start);
             }
 
         }
@@ -6806,8 +7041,8 @@ class ScanCheckers
     public static function CriticalJS_PARA($l_Content, &$l_Pos, &$l_SigId, $signs, $debug = null)
     {
         foreach ($signs->X_JSVirSig as $l_Item) {
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_start = microtime(true);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_start = AibolitHelpers::currentTime();
             }
 
             if (preg_match('~' . $l_Item . '~smi', $l_Content, $l_Found, PREG_OFFSET_CAPTURE)) {
@@ -6823,9 +7058,9 @@ class ScanCheckers
                 }
             }
 
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_stop = microtime(true);
-                $debug->addPerfomanceItem($l_Item, $stat_stop - $stat_start);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_stop = AibolitHelpers::currentTime();
+                $debug->addPerformanceItem($l_Item, $stat_stop - $stat_start);
             }
         }
         return false;
@@ -6866,8 +7101,8 @@ class ScanCheckers
     public static function CriticalPHP_3($l_Content, &$l_Pos, &$l_SigId, $signs, $debug = null)
     {
         foreach ($signs->X_FlexDBShe as $l_Item) {
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_start = microtime(true);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_start = AibolitHelpers::currentTime();
             }
 
             if (preg_match('~' . $l_Item . '~smiS', $l_Content, $l_Found, PREG_OFFSET_CAPTURE)) {
@@ -6883,9 +7118,9 @@ class ScanCheckers
                 }
             }
 
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_stop = microtime(true);
-                $debug->addPerfomanceItem($l_Item, $stat_stop - $stat_start);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_stop = AibolitHelpers::currentTime();
+                $debug->addPerformanceItem($l_Item, $stat_stop - $stat_start);
             }
         }
         return false;
@@ -6894,8 +7129,8 @@ class ScanCheckers
     public static function CriticalPHP_2($l_Content, &$l_Pos, &$l_SigId, $signs, $debug = null)
     {
         foreach ($signs->XX_FlexDBShe as $l_Item) {
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_start = microtime(true);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_start = AibolitHelpers::currentTime();
             }
 
             if (preg_match('~' . $l_Item . '~smiS', $l_Content, $l_Found, PREG_OFFSET_CAPTURE)) {
@@ -6911,9 +7146,9 @@ class ScanCheckers
                 }
             }
 
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_stop = microtime(true);
-                $debug->addPerfomanceItem($l_Item, $stat_stop - $stat_start);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_stop = AibolitHelpers::currentTime();
+                $debug->addPerformanceItem($l_Item, $stat_stop - $stat_start);
             }
         }
         return false;
@@ -6962,13 +7197,13 @@ class ScanCheckers
         foreach ($signs->_FlexDBShe as $l_Item) {
             $offset = 0;
 
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_start = microtime(true);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_start = AibolitHelpers::currentTime();
             }
-            $time = microtime(true);
+            $time = AibolitHelpers::currentTime();
             $res = preg_match('~' . $l_Item . '~smiS', $l_Content, $l_Found, PREG_OFFSET_CAPTURE, $offset);
-            if (class_exists('PerfomanceStats')) {
-                PerfomanceStats::addPerfomanceItem(PerfomanceStats::PCRE_SCAN_STAT, microtime(true) - $time);
+            if (class_exists('PerformanceStats')) {
+                PerformanceStats::addPerformanceItem(PerformanceStats::PCRE_SCAN_STAT, AibolitHelpers::currentTime() - $time);
             }
             while ($res) {
                 if (!self::CheckException($l_Content, $l_Found, $signs)) {
@@ -6984,15 +7219,15 @@ class ScanCheckers
                 }
 
                 $offset = $l_Found[0][1] + 1;
-                $time = microtime(true);
+                $time = AibolitHelpers::currentTime();
                 $res = preg_match('~' . $l_Item . '~smiS', $l_Content, $l_Found, PREG_OFFSET_CAPTURE, $offset);
-                if (class_exists('PerfomanceStats')) {
-                    PerfomanceStats::addPerfomanceItem(PerfomanceStats::PCRE_SCAN_STAT, microtime(true) - $time);
+                if (class_exists('PerformanceStats')) {
+                    PerformanceStats::addPerformanceItem(PerformanceStats::PCRE_SCAN_STAT, AibolitHelpers::currentTime() - $time);
                 }
             }
-            if (is_object($debug) && $debug->getDebugPerfomance() == true) {
-                $stat_stop = microtime(true);
-                $debug->addPerfomanceItem($l_Item, $stat_stop - $stat_start);
+            if (is_object($debug) && $debug->getDebugPerformance() == true) {
+                $stat_stop = AibolitHelpers::currentTime();
+                $debug->addPerformanceItem($l_Item, $stat_stop - $stat_start);
             }
 
         }
@@ -7028,6 +7263,7 @@ class ScanCheckers
         $offset     = 0;
 
         while (preg_match(self::URL_GRAB, $l_Content, $l_Found, PREG_OFFSET_CAPTURE, $offset)) {
+            $l_Found[2][0] = str_replace('\/', '/', $l_Found[2][0]);
             if (!self::isOwnUrl($l_Found[2][0], $signs->getOwnUrl())
                 && (isset($signs->whiteUrls) && !self::isUrlInList($l_Found[2][0], $signs->whiteUrls->getDb()))
             ) {
@@ -7469,6 +7705,7 @@ class Helpers
      */
     public static function unwrapGoto(&$content): string
     {
+        $processed = [];
         if (!preg_match('~\$[^\[\(\)\]=\+\-]{1,20}~msi', $content)) {
             return $content;
         }
@@ -7476,6 +7713,8 @@ class Helpers
         $label_name = 'tmp_spec_label';
 
         $replaceVars = [];
+
+        $orig = $content;
 
         $content = preg_replace_callback('~\bgoto ([^\w;]+);~msi', function ($m) use (&$replaceVars, &$label_num, $label_name) {
             $label_num++;
@@ -7496,7 +7735,7 @@ class Helpers
 
         preg_match_all('~\bgoto\s?(\w+);~msi', $content, $gotoMatches, PREG_SET_ORDER);
         $gotoCount = count($gotoMatches);
-        if (!$gotoCount || ($gotoCount <= 0 && $gotoCount > self::GOTO_MAX_HOPS)) {
+        if ($gotoCount === 0 || $gotoCount > self::GOTO_MAX_HOPS) {
             return $content;
         }
 
@@ -7522,24 +7761,25 @@ class Helpers
         //try to match all if's conditions it can be if or loop
         preg_match_all('~\b(\w+):\s*if\s*(\([^)(]*+(?:(?2)[^)(]*)*+\))\s*\{\s*goto\s*(\w+); (' . $label_name . '\d+):\s*\}\s*goto\s*(\w+);~msi', $content, $conds, PREG_SET_ORDER);
         foreach ($conds as $cond) {
-            preg_match('~\b\w+:\s*(\w+):\s*goto\s*' . $cond[1] . '~msi', $content, $while);
-            if (preg_match('~\b\w+:\s*goto\s*' . $while[1] . ';\s*goto\s*\w+;~msi', $content) === 0) {
-                $while = [];
-            }
-            preg_match('~\b' . $cond[5] . ':\s*(\w+):\s*goto\s*(\w+);~msi', $content, $do);
-            preg_match('~\b(\w+):\s*' . $cond[3] . ':\s*goto\s*(\w+);~msi', $content, $m);
-            preg_match('~\b(\w+):\s*goto\s*(\w+); goto\s*' . $m[1] . ';~msi', $content, $ifelse);
-            preg_match('~\b(\w+):\s*\w+:\s*goto\s*' . $cond[1] . ';~msi', $content, $m);
-            preg_match('~\b(\w+):[^:;]+[:;]\s*goto\s*(' . $m[1] . ');~msi', $content, $m);
-            preg_match('~\b(\w+):\s*' . $ifelse[2] . ':\s*goto\s*(\w+);~msi', $content, $m);
+            preg_match('~\b\w+:\s*(\w+):\s*goto\s*' . $cond[1] . '~msi',        $content, $while);
+            preg_match('~\b' . $cond[5] . ':\s*(\w+):\s*goto\s*(\w+);~msi',     $content, $do);
+            preg_match('~\b(\w+):\s*' . $cond[3] . ':\s*goto\s*(\w+);~msi',     $content, $m);
+            preg_match('~\b(\w+):\s*goto\s*(\w+); goto\s*' . $m[1] . ';~msi',   $content, $ifelse);
+            preg_match('~\b(\w+):\s*\w+:\s*goto\s*' . $cond[1] . ';~msi',       $content, $m);
+            preg_match('~\b(\w+):[^:;]+[:;]\s*goto\s*(' . $m[1] . ');~msi',     $content, $m);
+            preg_match('~\b(\w+):\s*' . $ifelse[2] . ':\s*goto\s*(\w+);~msi',   $content, $m);
             if (!empty($m) && ($m[2] === $cond[1])) { // if goto in last match point to this if statement - we have a loop, otherwise - if-else
                 $ifelse = [];
+            }
+            if (preg_match('~\b\w+:\s*goto\s*' . $while[1] . ';\s*goto\s*\w+;~msi', $content) === 0) {
+                $while = [];
             }
 
             if (empty($do) && empty($ifelse)) { //reverse conditions except do while & if else
                 if ($cond[2][1] === '!') {
                     $cond[2] = substr_replace($cond[2], '', 1, 1);
-                } else {
+                }
+                else {
                     $cond[2] = '(!' . $cond[2] . ')';
                 }
             }
@@ -7547,48 +7787,64 @@ class Helpers
             if (!empty($ifelse)) {
                 $content = str_replace($cond[0],
                     $cond[1] . ': if ' . $cond[2] . ' { goto ' . $cond[3] . '; ' . $cond[4] . ': ' . '} else { goto ' . $cond[5] . ';',
-                    $content);
+                    $content
+                );
                 preg_match('~(\w+):\s*(' . $ifelse[2] . '):\s*goto\s*(\w+);~msi', $content, $m2);
                 $content = str_replace($m2[0],
-                    $m2[1] . ': goto ' . $cond[4] . '; ' . $m2[2] . ': } goto ' . $m2[3] . ';', $content);
-            } elseif (!empty($do)) {
+                    $m2[1] . ': goto ' . $cond[4] . '; ' . $m2[2] . ': } goto ' . $m2[3] . ';',
+                    $content
+                );
+            }
+            elseif (!empty($do)) {
                 preg_match('~(\w+):\s*(' . $cond[3] . '):\s*goto\s*~msi', $content, $match);
                 $tmp = $cond[0];
-                $content = str_replace($match[0], $match[1] . ': do { goto ' . $match[2] . '; ' . $match[2] . ': goto ',
-                    $content);
+                $content = str_replace($match[0],
+                    $match[1] . ': do { goto ' . $match[2] . '; ' . $match[2] . ': goto ',
+                    $content
+                );
                 $cond[0] = $cond[1] . ': } while ' . $cond[2] . '; goto ' . $cond[5] . ';';
                 $content = str_replace($tmp, $cond[0], $content);
-            } else {
+            }
+            else {
                 if (!empty($while)) { //loop change if to while, reverse condition, exchange labels; in last goto $tmp_labelN
                     preg_match('~\w+:\s*goto\s*(' . $while[1] . ')~msi', $content, $match);
                     $content = str_replace($match[0], str_replace($match[1], $cond[4], $match[0]), $content);
                     $content = str_replace($cond[0],
                         $cond[1] . ': ' . 'while (' . $cond[2] . ') {' . 'goto ' . $cond[5] . '; ' . $cond[4] . ': } goto ' . $cond[3] . ';',
-                        $content);
-                } else { //just if - need to reverse condition and exchange labels; in last need goto to $tmp_labelN
+                        $content
+                    );
+                }
+                else { //just if - need to reverse condition and exchange labels; in last need goto to $tmp_labelN
                     $tmp = $cond[0];
                     $cond[0] = $cond[1] . ': ' . 'if ' . $cond[2] . ' { goto ' . $cond[5] . '; ' . $cond[4] . ': } goto ' . $cond[3] . ';';
                     $content = str_replace($tmp, $cond[0], $content);
                     preg_match('~(\w+):\s*(' . $cond[3] . '):\s*goto\s*(\w+)~msi', $content, $match);
                     $content = str_replace($match[0],
-                        $match[1] . ': goto ' . $cond[4] . '; ' . $match[2] . ': goto ' . $match[3], $content);
+                        $match[1] . ': goto ' . $cond[4] . '; ' . $match[2] . ': goto ' . $match[3],
+                        $content
+                    );
                 }
             }
         }
 
         $nextGotoPos = 0;
-        while ($nextGotoPos !== false && $hops > 0 && preg_match('~goto\s(\w+);~msi',
-                substr($content, $nextGotoPos),
-                $gotoNameMatch,
-                PREG_OFFSET_CAPTURE)) {
-
+        while ($nextGotoPos !== false
+            && $hops-- > 0
+            && preg_match('~goto\s(\w+);~msi', substr($content, $nextGotoPos), $gotoNameMatch, PREG_OFFSET_CAPTURE)
+        ) {
             $gotoNameStr    = $gotoNameMatch[1][0] . ':';
             $gotoNameStrLen = strlen($gotoNameStr);
             $gotoPos        = strpos($content, $gotoNameStr);
             $nextGotoPos    = strpos($content, 'goto ', $gotoPos);
             $cutUntilPos    = ($nextGotoPos - $gotoPos) - $gotoNameStrLen;
-
-            $substr = '';
+            if ($gotoPos === false) {
+                return $orig;
+            }
+            if (in_array($gotoNameStr, $processed)) {
+                $nextGotoPos    = strpos($content, 'goto ', strpos($content, $gotoNameMatch[0][0]) + 1);
+                continue;
+            }
+            $processed[] = $gotoNameStr;
 
             if ($nextGotoPos) {
                 $substr = substr($content, $gotoPos + $gotoNameStrLen, $cutUntilPos);
@@ -7598,7 +7854,6 @@ class Helpers
 
             $piece = trim($substr);
             $piece === '' ?: $res .= $piece . ' ';
-            $hops--;
         }
         $res = preg_replace('~\w{1,20}:~msi', '', $res);
         $res = stripcslashes($res);
@@ -7656,7 +7911,7 @@ class Helpers
     }
 
     /**
-     * Parse array values om string and return array
+     * Parse array values of string and return array
      *
      * @param $string
      * @return array
@@ -7724,7 +7979,7 @@ class Helpers
             'str_rot13', 'urldecode', 'rawurldecode', 'stripslashes', 'chr',
             'htmlspecialchars_decode', 'convert_uudecode','pack', 'ord',
             'str_repeat', 'sprintf', 'str_replace', 'strtr', 'hex2bin',
-            'helpers::unserialize',
+            'trim', 'ltrim', 'rtrim', 'helpers::unserialize',
         ];
 
         return in_array(strtolower($func), $safeFuncs);
@@ -7817,11 +8072,14 @@ class Helpers
      */
     public static function getVarsFromDictionaryDynamically(array &$vars = [], string $content = ''): array
     {
-        preg_match_all('~(\$\w+)(\.)?\s?=\s?(?:\$\w+[{\[]?\d+[}\]]?\.?)+;~msi', $content, $varsMatches, PREG_SET_ORDER);
+        preg_match_all('~(\$(?:GLOBALS\[\')?\w+)(?:\'\])?(\.)?\s?\.?=\s?((?:\$(?:GLOBALS\[\')?\w+(?:\'\])?[{\[]?\d*[}\]]?\s?\.?\s?)+);~msi', $content, $varsMatches, PREG_SET_ORDER);
+
         foreach ($varsMatches as $varsMatch) {
-            preg_match_all('~(\$\w+)[{\[]?(\d+)?[}\]]?~msi', $varsMatch[0], $subVarsMatches, PREG_SET_ORDER);
+            preg_match_all('~(\$(?:GLOBALS\[\')?\w+)(?:\'])?[{\[]?(\d+)?[}\]]?~msi', $varsMatch[3], $subVarsMatches, PREG_SET_ORDER);
             $concat = '';
+            $varsMatch[1] = str_replace('GLOBALS[\'', '', $varsMatch[1]);
             foreach ($subVarsMatches as $subVarsMatch) {
+                $subVarsMatch[1] = str_replace('GLOBALS[\'', '', $subVarsMatch[1]);
                 if (isset($subVarsMatch[2])) {
                     $concat .= $vars[$subVarsMatch[1]][(int)$subVarsMatch[2]] ?? '';
                 } else if ($varsMatch[1] !== $subVarsMatch[1]) {
@@ -7888,7 +8146,7 @@ class Helpers
      */
     public static function concatStringsInContent($str) : string
     {
-        $strVar = preg_replace_callback('~(?:[\'"][\w=();]*[\'"]\.?){2,}~msi', static function ($m) {
+        $strVar = preg_replace_callback('~(?:[\'"][\w=();]*[\'"]\s?\.?\s?){2,}~msi', static function ($m) {
             return '\'' . self::concatStr($m[0]) . '\'';
         }, $str);
         return $strVar;
@@ -7908,9 +8166,12 @@ class Helpers
     public static function replaceVarsFromDictionary($dictionaryVar, $dictionaryValue, $str, $quote = true) : string
     {
         $result = $str;
-        $result = preg_replace_callback('~(?:(\$(?:GLOBALS\[[\'"])?\w+(?:[\'"]\])?)[\[{][\'"]?(\d+)[\'"]?[\]}]\s?(\.)?\s?)~msi',
+        $result = preg_replace_callback('~(?:(\$(?:GLOBALS\[[\'"])?\w+(?:[\'"]\])?)[\[{][\'"]?([\da-fx]+)[\'"]?[\]}]\s?(\.)?\s?)~msi',
             function ($match) use ($dictionaryValue, $dictionaryVar, $quote) {
-                if ($match[1] !== $dictionaryVar && !isset($dictionaryValue[(int)$match[2]])) {
+                if (substr($match[2], 0, 2) === '0x') {
+                    $match[2] = hexdec($match[2]);
+                }
+                if ($match[1] !== $dictionaryVar || !isset($dictionaryValue[(int)$match[2]])) {
                     return $match[0];
                 }
                 $lastChar = $match[3] ?? '';
@@ -7962,10 +8223,11 @@ class Helpers
         if (!is_string($str)) {
             return $vars;
         }
-        preg_match_all('~(\$\w+)\s?(\.)?=\s?([\'"].*?[\'"]);~msi', $str, $matches);
+        preg_match_all('~(\$(?:GLOBALS\[[\'"])?\w+)(?:[\'"]\])?\s?(\.)?=\s?([\'"].*?[\'"]);~msi', $str, $matches);
 
         foreach ($matches[1] as $index => $match) {
             $varName = $match;
+            $varName = str_replace(['GLOBALS[\'', 'GLOBALS["'], '', $varName);
             $varValue = str_replace("$trimQuote.$trimQuote", '', $matches[3][$index]);
             $varValue = stripcslashes(trim($varValue, $trimQuote));
             if ($matches[2][$index] !== '.') {
@@ -7991,6 +8253,9 @@ class Helpers
      */
     public static function collectConcatedVars(&$str, string $trimQuote = '"', &$vars = [], $remove = false): array
     {
+        if (!isset($vars)) {
+            $vars = [];
+        }
         if (!is_string($str)) {
             return $vars;
         }
@@ -8054,7 +8319,7 @@ class Helpers
      */
     public static function collectFuncVars(string &$str, &$vars = [], $quotes = true, $delete = false): array
     {
-        preg_match_all('~(\$\w+)\s*=\s*(\w+)\([\'"]([\w+/=]+)[\'"](?:,\s*[\'"]([\w+/=]*)[\'"],\s*[\'"]([\w+/=]+)[\'"])?\);~msi', $str, $matches, PREG_SET_ORDER);
+        preg_match_all('~(\$\w+)\s*=\s*(\w+)\([\'"]([\w+/=\*]+)[\'"](?:,\s*[\'"]([\w+/=]*)[\'"])?(?:,\s*[\'"]([\w+/=]+)[\'"])?\);~msi', $str, $matches, PREG_SET_ORDER);
 
         foreach ($matches as $match) {
             $func = $match[2];
@@ -8064,9 +8329,11 @@ class Helpers
 
             if (self::convertToSafeFunc($func)) {
                 if ($func === 'str_replace') {
-                    $ret = @$func($param1, $param2, $param3);
+                    $ret = @self::executeWrapper($func, [$param1, $param2, $param3]);
+                } else if (in_array($func, ['trim', 'ltrim', 'rtrim', 'pack'])) {
+                    $ret = @self::executeWrapper($func, [$param1, $param2]);
                 } else {
-                    $ret = @$func($param1);
+                    $ret = @self::executeWrapper($func, [$param1]);
                 }
             }
             $vars[$match[1]] = self::convertToSafeFunc($ret) ? $ret : ($quotes ? "'$ret'" : $ret);
@@ -8095,10 +8362,14 @@ class Helpers
         foreach ($vars as $name => $value) {
             $sub_name = substr($name, 1);
             $result = preg_replace_callback('~{?(@)?\${?[\'"]?GLOBALS[\'"]?}?\[[\'"](\w+)[\'"]\]}?~msi',
-                function ($m) use ($value, $sub_name) {
+                function ($m) use ($value, $sub_name, $toStr) {
                     if ($m[2] !== $sub_name) {
                         return $m[0];
                     }
+                    if ($toStr) {
+                        return $m[1] . "'$value'";
+                    }
+
                     return $m[1] . $value;
                 }, $result);
 
@@ -8113,24 +8384,9 @@ class Helpers
             } else if ($toStr) {
                 $result = str_replace($name, "'$value'", $result);
             }
-
         }
 
         return $result;
-    }
-
-    /**
-     * @param $str
-     * @return array
-     */
-    public static function collectVarsChars($str)
-    {
-        $vars = [];
-        preg_match_all('~(\$\w+)=\'(\w)\';~msi', $str, $matches, PREG_SET_ORDER);
-        foreach ($matches as $m) {
-            $vars[$m[1]] = $m[2];
-        }
-        return $vars;
     }
 
     /**
@@ -8175,8 +8431,29 @@ class Helpers
      */
     public static function replaceBase64Decode($str, $quote = '\'')
     {
-        return preg_replace_callback(self::REGEXP_BASE64_DECODE, static function ($m) use ($quote) {
-            return $quote . base64_decode($m[1]) . $quote;
+        $hangs = 10;
+        while(preg_match(self::REGEXP_BASE64_DECODE, $str) && $hangs--) {
+            $str = preg_replace_callback(self::REGEXP_BASE64_DECODE, static function ($m) use ($quote) {
+                if (substr($m[1], 0, 2) === '\x') {
+                    $m[1] = stripcslashes($m[1]);
+                }
+                return $quote . base64_decode($m[1]) . $quote;
+            }, $str);
+        }
+        return $str;
+    }
+
+    /**
+     * Expand hex2bin() function
+     *
+     * @param string $str
+     * @param string $quote
+     * @return string
+     */
+    public static function replaceHex2Bin($str, $quote = '\'')
+    {
+        return preg_replace_callback('~hex2bin\s*\(\s*[\'"]([^\'"]*)[\'"]\s*\)~msi', static function ($m) use ($quote) {
+            return $quote . hex2bin($m[1]) . $quote;
         }, $str);
     }
 
@@ -8697,21 +8974,21 @@ class Helpers
 
     public static function decodeClassDecryptedWithKey(string $data, int $num, string $key): string
     {
-        function CTL($start, &$data, &$data_long)
+        $CTL = function ($start, &$data, &$data_long)
         {
             $n = strlen($data);
             $tmp = unpack('N*', $data);
             $j = $start;
             foreach ($tmp as $value) $data_long[$j++] = $value;
             return $j;
-        }
+        };
 
-        function LtoC($l)
+        $LtoC = function ($l)
         {
             return pack('N', $l);
-        }
+        };
 
-        function add($i1, $i2)
+        $add = function ($i1, $i2)
         {
             $result = 0.0;
             foreach (func_get_args() as $value) {
@@ -8729,23 +9006,9 @@ class Helpers
                 $result += 0xffffffff + 1.0;
             }
             return $result;
-        }
+        };
 
-        function delg($y, $z, &$w, &$k, $num)
-        {
-            $sum = 0xC6EF3720;
-            $klhys = 0x9E3779B9;
-            $n = $num;
-            while ($n-- > 0) {
-                $z = add($z, -(add($y << 4 ^ rsLT($y, 5), $y) ^ add($sum, $k[rsLT($sum, 11) & 3])));
-                $sum = add($sum, -$klhys);
-                $y = add($y, -(add($z << 4 ^ rsLT($z, 5), $z) ^ add($sum, $k[$sum & 3])));
-            }
-            $w[0] = $y;
-            $w[1] = $z;
-        }
-
-        function rsLT($integer, $n)
+        $rsLT = function ($integer, $n)
         {
             if (0xffffffff < $integer || -0xffffffff > $integer) {
                 $integer = fmod($integer, 0xffffffff + 1);
@@ -8763,9 +9026,23 @@ class Helpers
                 $integer >>= $n;
             }
             return $integer;
-        }
+        };
 
-        function resize(&$data, $size, $nonull = false)
+        $delg = function ($y, $z, &$w, &$k, $num) use ($add, $rsLT)
+        {
+            $sum = 0xC6EF3720;
+            $klhys = 0x9E3779B9;
+            $n = $num;
+            while ($n-- > 0) {
+                $z = $add($z, -($add($y << 4 ^ $rsLT($y, 5), $y) ^ $add($sum, $k[$rsLT($sum, 11) & 3])));
+                $sum = $add($sum, -$klhys);
+                $y = $add($y, -($add($z << 4 ^ $rsLT($z, 5), $z) ^ $add($sum, $k[$sum & 3])));
+            }
+            $w[0] = $y;
+            $w[1] = $z;
+        };
+
+        $resize = function (&$data, $size, $nonull = false)
         {
             $n = strlen($data);
             $nmod = $n % $size;
@@ -8782,11 +9059,11 @@ class Helpers
                 }
             }
             return $n;
-        }
+        };
 
-        $ncdL = CTL(0, $data, $enc_data_long);
-        resize($key, 16, true);
-        $n_key_long = CTL(0, $key, $key_long);
+        $ncdL = $CTL(0, $data, $enc_data_long);
+        $resize($key, 16, true);
+        $n_key_long = $CTL(0, $key, $key_long);
         $data = '';
         $w = array(0, 0);
         $j = 0;
@@ -8806,25 +9083,25 @@ class Helpers
                 $k[3] = $key_long[($j + 3) % $n_key_long];
             }
             $j = ($j + 4) % $n_key_long;
-            delg($enc_data_long[$i], $enc_data_long[$i + 1], $w, $k, $num);
+            $delg($enc_data_long[$i], $enc_data_long[$i + 1], $w, $k, $num);
             if (0 == $i) {
                 $len = $w[0];
                 if (4 <= $len) {
-                    $data .= LtoC($w[1]);
+                    $data .= $LtoC($w[1]);
                 } else {
-                    $data .= substr(LtoC($w[1]), 0, $len % 4);
+                    $data .= substr($LtoC($w[1]), 0, $len % 4);
                 }
             } else {
                 $pos = ($i - 1) * 4;
                 if ($pos + 4 <= $len) {
-                    $data .= LtoC($w[0]);
+                    $data .= $LtoC($w[0]);
                     if ($pos + 8 <= $len) {
-                        $data .= LtoC($w[1]);
+                        $data .= $LtoC($w[1]);
                     } elseif ($pos + 4 < $len) {
-                        $data .= substr(LtoC($w[1]), 0, $len % 4);
+                        $data .= substr($LtoC($w[1]), 0, $len % 4);
                     }
                 } else {
-                    $data .= substr(LtoC($w[0]), 0, $len % 4);
+                    $data .= substr($LtoC($w[0]), 0, $len % 4);
                 }
             }
         }
@@ -8957,21 +9234,21 @@ class Helpers
         $JYekrRTYM = str_rot13(gzinflate(str_rot13(base64_decode('y8svKCwqLiktK6+orFdZV0FWWljPyMzKzsmNNzQyNjE1M7ewNAAA'))));
         if ($WWAcmoxRAZq == 'asedferg456789034689gd') {
             $cEerbvwKPI = $JYekrRTYM[18] . $JYekrRTYM[19] . $JYekrRTYM[17] . $JYekrRTYM[17] . $JYekrRTYM[4] . $JYekrRTYM[21];
-            return Helpers::convertToSafeFunc($cEerbvwKPI) ? $cEerbvwKPI($sBtUiFZaz) : '';
+            return self::convertToSafeFunc($cEerbvwKPI) ? @self::executeWrapper($cEerbvwKPI, [$sBtUiFZaz]) : '';
         } elseif ($WWAcmoxRAZq == 'zfcxdrtgyu678954ftyuip') {
             $JWTDeUKphI = $JYekrRTYM[1] . $JYekrRTYM[0] . $JYekrRTYM[18] . $JYekrRTYM[4] . $JYekrRTYM[32] .
                 $JYekrRTYM[30] . $JYekrRTYM[26] . $JYekrRTYM[3] . $JYekrRTYM[4] . $JYekrRTYM[2] . $JYekrRTYM[14] .
                 $JYekrRTYM[3] . $JYekrRTYM[4];
-            return Helpers::convertToSafeFunc($JWTDeUKphI) ? $JWTDeUKphI($sBtUiFZaz) : '';
+            return self::convertToSafeFunc($JWTDeUKphI) ? @self::executeWrapper($JWTDeUKphI, [$sBtUiFZaz]) : '';
         } elseif ($WWAcmoxRAZq == 'gyurt456cdfewqzswexcd7890df') {
             $rezmMBMev = $JYekrRTYM[6] . $JYekrRTYM[25] . $JYekrRTYM[8] . $JYekrRTYM[13] . $JYekrRTYM[5] . $JYekrRTYM[11] . $JYekrRTYM[0] . $JYekrRTYM[19] . $JYekrRTYM[4];
-            return Helpers::convertToSafeFunc($rezmMBMev) ? $rezmMBMev($sBtUiFZaz) : '';
+            return self::convertToSafeFunc($rezmMBMev) ? @self::executeWrapper($rezmMBMev, [$sBtUiFZaz]) : '';
         } elseif ($WWAcmoxRAZq == 'zcdfer45dferrttuihvs4321890mj') {
             $WbbQXOQbH = $JYekrRTYM[18] . $JYekrRTYM[19] . $JYekrRTYM[17] . $JYekrRTYM[26] . $JYekrRTYM[17] . $JYekrRTYM[14] . $JYekrRTYM[19] . $JYekrRTYM[27] . $JYekrRTYM[29];
-            return Helpers::convertToSafeFunc($WbbQXOQbH) ? $WbbQXOQbH($sBtUiFZaz) : '';
+            return self::convertToSafeFunc($WbbQXOQbH) ? @self::executeWrapper($WbbQXOQbH, [$sBtUiFZaz]) : '';
         } elseif ($WWAcmoxRAZq == 'zsedrtre4565fbghgrtyrssdxv456') {
             $jPnPLPZcMHgH = $JYekrRTYM[2] . $JYekrRTYM[14] . $JYekrRTYM[13] . $JYekrRTYM[21] . $JYekrRTYM[4] . $JYekrRTYM[17] . $JYekrRTYM[19] . $JYekrRTYM[26] . $JYekrRTYM[20] . $JYekrRTYM[20] . $JYekrRTYM[3] . $JYekrRTYM[4] . $JYekrRTYM[2] . $JYekrRTYM[14] . $JYekrRTYM[3] . $JYekrRTYM[4];
-            return Helpers::convertToSafeFunc($jPnPLPZcMHgH) ? $jPnPLPZcMHgH($sBtUiFZaz) : '';
+            return self::convertToSafeFunc($jPnPLPZcMHgH) ? @self::executeWrapper($jPnPLPZcMHgH, [$sBtUiFZaz]) : '';
         }
     }
 
@@ -9203,7 +9480,7 @@ class Helpers
                 $args[$i][$j] = chr(ord($args[$i][$j]) - ($i ? $args[$j xor $j] : 1));
             }
             if ($i === 2 && self::convertToSafeFunc($args[1]) && self::convertToSafeFunc($args[2])) {
-                $args[3] = @$args[1](@$args[2]($args[3]));
+                $args[3] = @self::executeWrapper($args[1], [@self::executeWrapper($args[2], [$args[3]])]);
             }
         }
 
@@ -9225,7 +9502,7 @@ class Helpers
                 $args[$i][$j] = chr(ord($args[$i][$j]) - 1);
             }
             if ($i === 1 && self::convertToSafeFunc($args[0]) && self::convertToSafeFunc($args[1])) {
-                $args[2] = @$args[0](@$args[1]($args[2]));
+                $args[2] = @self::executeWrapper($args[0],[@self::executeWrapper($args[1], [$args[2]])]);
             }
         }
 
@@ -9273,7 +9550,7 @@ class Helpers
                 break;
             }
             if (self::convertToSafeFunc($params[$i])) {
-                $params[0] = $params[$i]($params[0]);
+                $params[0] = @self::executeWrapper($params[$i], [$params[0]]);
             }
             if ($i === $iMax - 1) {
                 $i = -1;
@@ -9437,6 +9714,52 @@ class Helpers
         return $str;
     }
 
+    public static function varFuncStrDecoder(string $strData): string
+    {
+        $strLen = strlen(trim($strData));
+        $result = '';
+        for ($i = 0; $i < $strLen; $i += 2) {
+            $result .= pack("C", hexdec(substr($strData, $i, 2)));
+        }
+
+        return $result;
+    }
+
+    public static function executeWrapper(string $func, array $params = [])
+    {
+        $res = '';
+        try {
+            $res = call_user_func_array($func, $params);
+        } catch (Throwable $e) {
+
+        }
+        return $res;
+    }
+
+    public static function decodeUCSDelta($encoded)
+    {
+        $res        = '';
+        $delta      = -15;
+        $codepage   = 'UTF-8';
+        $encoded    = iconv_substr(preg_replace('/.*?SQUID(.*)/i','$1', $encoded), 0, -7);
+        $encoded    = preg_replace(['/\/x7b/s', '/\/x7d/s'],['{', '}'], $encoded);
+
+        if (empty($encoded)) {
+            return false;
+        }
+
+        for ($i = strlen(utf8_decode($encoded)); $i > 0; --$i) {
+            $char       = iconv_substr($encoded, 0, 1, $codepage);
+            $ucs_char   = iconv($codepage, 'UCS-4', $char);
+            $ulong      = unpack('N', $ucs_char);
+            $ucs_char   = pack('N', $ulong[1] + $delta);
+            $res       .= iconv('UCS-4', $codepage, $ucs_char);
+            unset($ucs_char,$ulong);
+            $encoded    = iconv_substr($encoded, 1, $i, $codepage);
+        }
+        return $res;
+    }
+
     private static function block_decrypt($y, $z, $key)
     {
         $delta = 0x9e3779b9;
@@ -9513,6 +9836,10 @@ class Helpers
         return pack('N', $l);
     }
 
+    public static function currentTime()
+    {
+        return function_exists('hrtime') ? hrtime(true) / 1e9 : microtime(true);
+    }
 }
 
 /**
@@ -9527,12 +9854,15 @@ class MathCalc {
     const ELEMENT_TYPE  = 'type';
 
     const REGEXP_VALUE      = '[0-9]*\.[0-9]+|[1-9][0-9]*|0(?:x[\da-f]+|b[01]+|[0-7]+)|0';
-    const REGEXP_OPERATION  = '\+|\-|/|\*\*|\*|%|&|\||\^|\~|<<|>>';
+    const REGEXP_OPERATION  = '<=>|===|!==|==|!=|<>|<=|>=|&&|\|\||<<|>>|\*\*|\+|\-|/|\*|%|&|\||\^|\~|>|<';
     const REGEXP_VALUE_SIGN = '\-|\+';
+
+    protected static $debug                 = false;
+    protected static $debug_replacements    = [];
 
     private static $math_operations_order = [];
 
-    public static function calcRawString($raw_string, $max_iterations = 10)
+    public static function calcRawString($raw_string, $max_iterations = 20)
     {
         self::loadMathOperationsOrder();
 
@@ -9540,7 +9870,7 @@ class MathCalc {
         do {
             $old_string = $raw_string;
             $raw_string = self::calcRawStringOnePassWithParentheses($raw_string);
-            $raw_string = FuncCalc::calcFuncInRawStringOnePassWithParentheses($raw_string);
+            $raw_string = static::calcFuncInRawStringOnePassWithParentheses($raw_string);
             if ($raw_string == $old_string) {
                 break;
             }
@@ -9556,50 +9886,59 @@ class MathCalc {
             }
             $iterations++;
         } while($iterations < $max_iterations);
-
         return $raw_string;
     }
 
     ////////////////////////////////////////////////////////////////////////////
 
+    protected static function calcFuncInRawStringOnePassWithParentheses($raw_string)
+    {
+        return FuncCalc::calcFuncInRawStringOnePassWithParentheses($raw_string);
+    }
+
     private static function calcRawStringOnePassWithParentheses($raw_string)
     {
-        self::loadMathOperationsOrder();
-        $regexp_find_simple_math_operations = '('
+        $regexp_find_simple_math_operations = '(?>'
             . '\s*(?:\(\s*[+-]?\s*(?:' . self::REGEXP_VALUE . ')\s*\))\s*'
             . '|'
             . '\s*(?:' . self::REGEXP_VALUE . ')\s*'
             . '|'
             . '\s*(?:' . self::REGEXP_OPERATION . ')\s*'
             . ')+';
-        $regexp_find_math_operations_inside_brackets    = '\(' . $regexp_find_simple_math_operations . '\)';
+        $regexp_find_math_operations_inside_brackets    = '(?<=[(,=])' . $regexp_find_simple_math_operations . '(?=[),;])';
         return preg_replace_callback('~' . $regexp_find_math_operations_inside_brackets . '~mis', function($matches) {
             $original = $matches[0];
-            $math_string = substr($original, 1, strlen($original) - 2);
+            $math_string = $original;
             if (self::haveOnlyValue($math_string) || self::haveOnlyOperation($math_string)) {
                 return $original;
             }
             try {
                 $result = self::calcSimpleMath($math_string);
+                if (static::$debug) {
+                    self::$debug_replacements[] = [
+                        'method'    => 'MathCalc::calcRawStringOnePassWithParentheses',
+                        'original'  => $math_string,
+                        'result'    => $result,
+                    ];
+                }
             }
             catch (\Exception $e) {
                 return $original;
             }
-            return '(' . $result . ')';
+            return $result;
         }, $raw_string);
     }
 
     private static function calcRawStringOnePassWithoutParentheses($raw_string)
     {
-        self::loadMathOperationsOrder();
-        $regexp_find_simple_math_operations = '(?:'
+        $regexp_find_simple_math_operations = '(?>'
             . '\s*?(?:\(\s*[+-]?\s*(?:' . self::REGEXP_VALUE . ')\s*\))\s*?'
             . '|'
             . '\s*?(?:' . self::REGEXP_VALUE . ')\s*?'
             . '|'
             . '\s*?(?:' . self::REGEXP_OPERATION . ')\s*?'
             . ')+';
-        return preg_replace_callback('~(\s*)(' . $regexp_find_simple_math_operations . ')(\s*)~mis', function($matches){
+        return preg_replace_callback('~(?<=[^_$]|\b)(\s*)(' . $regexp_find_simple_math_operations . ')(\s*)~mis', function($matches){
             $begin          = $matches[1];
             $math_string    = $matches[2];
             $end            = $matches[3];
@@ -9617,17 +9956,24 @@ class MathCalc {
 
             try {
                 $result = self::calcSimpleMath($math_string);
+                if (static::$debug) {
+                    self::$debug_replacements[] = [
+                        'method'    => 'MathCalc::calcRawStringOnePassWithoutParentheses',
+                        'original'  => $math_string,
+                        'result'    => $result,
+                    ];
+                }
             }
             catch (\Exception $e) {
                 return $original;
             }
-
             return $begin . $result . $end;
         }, $raw_string);
     }
 
     private static function loadMathOperationsOrder()
     {
+        // See the order of operations here: https://www.php.net/manual/en/language.operators.precedence.php
         if (!empty(self::$math_operations_order)) {
             return;
         }
@@ -9704,6 +10050,70 @@ class MathCalc {
                 ],
             ],
             [
+                '<' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a < $b);
+                    },
+                ],
+                '<=' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a <= $b);
+                    },
+                ],
+                '>' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a > $b);
+                    },
+                ],
+                '>=' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a >= $b);
+                    },
+                ],
+            ],
+            [
+                '==' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a == $b);
+                    },
+                ],
+                '!=' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a != $b);
+                    },
+                ],
+                '===' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a === $b);
+                    },
+                ],
+                '!==' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a !== $b);
+                    },
+                ],
+                '<>' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a <> $b);
+                    },
+                ],
+                '<=>' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a <=> $b);
+                    },
+                ],
+            ],
+            [
                 '&' => [
                     'elements' => [-1, +1],
                     'func' => function($a, $b) {
@@ -9724,6 +10134,22 @@ class MathCalc {
                     'elements' => [-1, +1],
                     'func' => function($a, $b) {
                         return $a | $b;
+                    },
+                ],
+            ],
+            [
+                '&&' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a && $b);
+                    },
+                ],
+            ],
+            [
+                '||' => [
+                    'elements' => [-1, +1],
+                    'func' => function($a, $b) {
+                        return (int)($a || $b);
                     },
                 ],
             ],
@@ -9752,7 +10178,6 @@ class MathCalc {
 
     private static function calcSimpleMath($string, $max_iterations = 30)
     {
-
         $input_string = $string;
         $input_string = str_replace(' ', '', $input_string);
         $input_string = str_replace(['+-', '-+'], '-', $input_string);
@@ -9776,12 +10201,12 @@ class MathCalc {
             }
             elseif ($element === $matches[self::ELEMENT_TYPE_NUMBER][$index]) {
                 $type       = self::ELEMENT_TYPE_NUMBER;
-                $k = $element;
+                $k          = $element;
                 $element    = self::convertNum($element);
             }
             elseif ($element === $matches[self::ELEMENT_TYPE_SIMPLE_PARENTHESES][$index]) {
-                $type = self::ELEMENT_TYPE_NUMBER;
-                $element = self::convertNum(trim($element, '()'));
+                $type       = self::ELEMENT_TYPE_NUMBER;
+                $element    = self::convertNum(trim($element, '()'));
             }
             else {
                 throw new Exception();
@@ -9793,17 +10218,31 @@ class MathCalc {
             ];
         }
 
-        if ($math_array[0][self::ELEMENT_TYPE] == self::ELEMENT_TYPE_OPERATION
-            && $math_array[0][self::ELEMENT] == '-'
-            && $math_array[1][self::ELEMENT_TYPE] == self::ELEMENT_TYPE_NUMBER
-        ) {
-            unset($math_array[0]);
-            $math_array[1][self::ELEMENT] *= -1;
+        $need_reindex = false;
+        $last_element = null;
+        foreach ($math_array as $index => $item) {
+            if ($item[self::ELEMENT_TYPE] == self::ELEMENT_TYPE_OPERATION
+                && in_array($item[self::ELEMENT] , ['-'])
+                && isset($math_array[$index + 1])
+                && $math_array[$index + 1][self::ELEMENT_TYPE] == self::ELEMENT_TYPE_NUMBER
+                && (is_null($last_element) || $last_element[self::ELEMENT_TYPE] == self::ELEMENT_TYPE_OPERATION)
+            ) {
+                $math_array[$index + 1][self::ELEMENT] *= (int)($item[self::ELEMENT] . '1');
+                unset($math_array[$index]);
+                $need_reindex = true;
+            }
+            $last_element = $item;
+        }
+        if ($need_reindex) {
             $math_array = array_values($math_array);
         }
 
+        if (count($math_array) === 1 && $math_array[0][self::ELEMENT_TYPE] == self::ELEMENT_TYPE_NUMBER) {
+            return $math_array[0][self::ELEMENT];
+        }
+
         $changed = false;
-        foreach (self::$math_operations_order as $level => $operations) {
+        foreach (self::$math_operations_order as $operations) {
             $iterations = 0;
             do {
                 $interrupted = false;
@@ -9822,7 +10261,10 @@ class MathCalc {
                     $val1_index     = $index + $val1_offset;
                     $val2_index     = $index + $val2_offset;
 
-                    if(!isset($math_array[$val1_index])) {
+                    if (!isset($math_array[$val1_index])) {
+                        continue;
+                    }
+                    if ($math_array[$val1_index][self::ELEMENT_TYPE] == self::ELEMENT_TYPE_OPERATION) {
                         continue;
                     }
 
@@ -9841,13 +10283,17 @@ class MathCalc {
                         if (!isset($math_array[$val2_index])) {
                             continue;
                         }
+                        if ($math_array[$val2_index][self::ELEMENT_TYPE] != self::ELEMENT_TYPE_NUMBER) {
+                            continue;
+                        }
+
                         $val2 = $math_array[$val2_index][self::ELEMENT];
 
                         try {
                             $result = $func_params['func']($val1, $val2);
                         }
                         catch (\Exception $e) {
-                            throw new \Exception('');
+                            throw new \Exception();
                         }
                         $element[self::ELEMENT] = $result;
                     }
@@ -9903,32 +10349,57 @@ class MathCalc {
  * The class is auxiliary for MathCalc, calculates certain specific mathematical functions with explicit values
  */
 class FuncCalc {
+    protected static $debug                 = false;
+    protected static $debug_replacements    = [];
+
     private static $functions = [];
 
     private static $functions_regexp = '';
+
+    const REGEXP_VALUE      = '[0-9]*\.[0-9]+|[1-9][0-9]*|0(?:x[\da-f]+|b[01]+|[0-7]+)|0';
+    const REGEXP_VALUE_SIGN = '\-|\+';
 
     public static function calcFuncInRawStringOnePassWithParentheses($raw_string)
     {
         if (empty(self::$functions)) {
             self::loadFunctions();
         }
-
-        $regexp_find_functions = '(?:'
-                . '('.self::$functions_regexp.')'
-                . '\s*\(([^)]+)\)'
+        $regexp_find_functions = '(?>'
+                . '\b('.self::$functions_regexp.')\b' // functions name
+                . '\s*'
+                . '\('
+                    . '('
+                        . '(?>'
+                            . '\s*(?:' . self::REGEXP_VALUE_SIGN . ')?\s*(?:' . self::REGEXP_VALUE . ')\s*,?' // math value
+                            . '|'
+                            . '\s*"[^"]+"\s*,?' // double quoted string
+                            . '|'
+                            . '\s*\'[^\']+\'\s*,?' // single quoted string
+                        . ')*'
+                    . ')'
+                . '\)'
+                . '\s*'
                 . ')+';
 
         return preg_replace_callback('~' . $regexp_find_functions . '~mis', function($matches) {
             $name   = $matches[1];
             $params = $matches[2];
-            return self::calcFunction($name, $params);
+            $result = self::calcFunction($name, $params);
+            if (static::$debug) {
+                self::$debug_replacements[] = [
+                    'method'    => 'FuncCalc::calcFuncInRawStringOnePassWithParentheses',
+                    'original'  => $matches[0],
+                    'result'    => $result,
+                ];
+            }
+            return $result;
         }, $raw_string);
     }
 
     ////////////////////////////////////////////////////////////////////////////
 
     private static function calcFunction($name, $params) {
-        $result             = "$name($params)";//safely
+        $result             = "$name($params)"; // safely
         $name_lower         = strtolower($name);
         $function_otions    = isset(self::$functions[$name_lower]) ? self::$functions[$name_lower] : false;
         if (!$function_otions) {
@@ -9939,7 +10410,7 @@ class FuncCalc {
         $params_array = array_map('trim', $params_array);
 
         try {
-            return $function_otions['func'](...$params_array);//safely
+            return $function_otions['func'](...$params_array); // safely
         } catch (Exception $ex) {
             return $result;
         }
@@ -9968,14 +10439,97 @@ class FuncCalc {
                     return abs($a);
                 },
             ],
+            'pi' => [
+                'func' => function() {
+                    return pi();
+                }
+            ],
         ];
         self::$functions_regexp = implode('|', array_keys(self::$functions));
     }
 
 }
 
+class Debugger {
 
+    const DEBUG_COUNT = 'count';
+    const DEBUG_MEDIAN_TIME = 'median_time';
+    const DEBUG_MAX_TIME = 'max_time';
+    const DEBUG_MIN_TIME = 'min_time';
+    const DEBUG_TIME_LIST = 'time_list';
 
+    private $deobfuscatorData;
+
+    /**
+     * @param string $type
+     * @param string $id
+     * @param float $time_elapsed
+     * @return void
+     */
+    public function addDeobfuscatorData(string $type, string $id, float $time_elapsed): void
+    {
+        if (!isset($this->deobfuscatorData[$type][$id])) {
+            $this->deobfuscatorData[$type][$id][self::DEBUG_COUNT] = 1;
+            $this->deobfuscatorData[$type][$id][self::DEBUG_MEDIAN_TIME] = $time_elapsed;
+            $this->deobfuscatorData[$type][$id][self::DEBUG_MAX_TIME] = $time_elapsed;
+            $this->deobfuscatorData[$type][$id][self::DEBUG_MIN_TIME] = $time_elapsed;
+            $this->deobfuscatorData[self::DEBUG_TIME_LIST][$type][$id] = [$time_elapsed];
+        } else {
+            $this->deobfuscatorData[$type][$id][self::DEBUG_COUNT]++;
+            $this->deobfuscatorData[self::DEBUG_TIME_LIST][$type][$id][] = $time_elapsed;
+
+            if ($this->deobfuscatorData[$type][$id][self::DEBUG_MAX_TIME] < $time_elapsed) {
+                $this->deobfuscatorData[$type][$id][self::DEBUG_MAX_TIME] = $time_elapsed;
+            }
+
+            if ($this->deobfuscatorData[$type][$id][self::DEBUG_MIN_TIME] > $time_elapsed) {
+                $this->deobfuscatorData[$type][$id][self::DEBUG_MIN_TIME] = $time_elapsed;
+            }
+        }
+    }
+
+    public function getDeobfuscatorData(): array
+    {
+        if (isset($this->deobfuscatorData[self::DEBUG_TIME_LIST])) {
+            $this->calculateMedianTime();
+        }
+        return $this->deobfuscatorData;
+    }
+
+    private function calculateMedianTime()
+    {
+        $list = $this->deobfuscatorData[self::DEBUG_TIME_LIST];
+        unset($this->deobfuscatorData[self::DEBUG_TIME_LIST]);
+
+        foreach ($this->deobfuscatorData as $type => $deobfuscatorDatum) {
+            foreach ($deobfuscatorDatum as $id => $datum) {
+                $this->deobfuscatorData[$type][$id][self::DEBUG_MEDIAN_TIME] =
+                    $this->getMedianValue($list[$type][$id]);
+            }
+        }
+    }
+
+    private function getMedianValue(array $nums)
+    {
+        $count = count($nums);
+        asort($nums);
+        $midIndex = (int)floor($count/2);
+
+        if ($count < 1) {
+            return 0;
+        }
+
+        if ($count === 1) {
+            return $nums[0];
+        }
+
+        if ($count % 2 !== 0) {
+            return $nums[$midIndex];
+        }
+
+        return ($nums[$midIndex - 1] + $nums[$midIndex]) / 2;
+    }
+}
 
 ///////////////////////////////////////////////////////////////////////////
 
@@ -10022,9 +10576,12 @@ if (!defined('AIBOLIT_START_TIME') && !defined('PROCU_CLEAN_DB') && @strpos(__FI
     ini_set('realpath_cache_size', '16M');
     ini_set('realpath_cache_ttl', '1200');
     ini_set('pcre.jit', '1');
+    if (!defined('DEBUG_PERFORMANCE')) {
+        define('DEBUG_PERFORMANCE', 0);
+    }
     $options = parseArgs($argv);
-    $str = php_strip_whitespace($options[0]);
-    $str2 = file_get_contents($options[0]);
+    $str = @php_strip_whitespace($options[0]);
+    $str2 = @file_get_contents($options[0]);
     $l_UnicodeContent = Helpers::detect_utf_encoding($str);
     $l_UnicodeContent2 = Helpers::detect_utf_encoding($str2);
     if ($l_UnicodeContent !== false) {
@@ -10034,7 +10591,7 @@ if (!defined('AIBOLIT_START_TIME') && !defined('PROCU_CLEAN_DB') && @strpos(__FI
         }
     }
     $d = new Deobfuscator($str, $str2);
-    $start = microtime(true);
+    $start = Helpers::currentTime();
     $deobf_type = $d->getObfuscateType($str);
     if ($deobf_type != '') {
         $str = $d->deobfuscate();
@@ -10051,7 +10608,7 @@ if (!defined('AIBOLIT_START_TIME') && !defined('PROCU_CLEAN_DB') && @strpos(__FI
     }
     echo $code;
     echo "\n";
-    //echo 'Execution time: ' . round(microtime(true) - $start, 4) . ' sec.';
+    //echo 'Execution time: ' . round(Helpers::currentTime() - $start, 4) . ' sec.';
 }
 
 class Deobfuscator
@@ -10059,7 +10616,15 @@ class Deobfuscator
     const PCRE_BACKTRACKLIMIT = 4000000;
     const PCRE_RECURSIONLIMIT = 40000;
 
+    const TYPE_PREG_FULL = 'full';
+    const TYPE_PREG_FAST = 'fast';
+    const TYPE_FUNC = 'func';
+
     private static $signatures = [
+        [
+            'full' => '~(\$\w{1,20})\s*=\s*(chr\(\d{1,4}\)\.["\'][x\\\\\\\\a-f0-9]{1,60}["\'][^;]{1,60});\s*(\$\w{1,20})\s*=\s*([^;]{1,100});\s*(\$\w{1,20})\s*=\s*\1\(\3\(["\']([a-z0-9+/=]{1,50000})["\']\)\);\s*echo ["\']\{\$\{\s*eval\s*\(\5\)\s*\}\}["\'];~msi',
+            'id' => 'simpleEvalFunctions',
+        ],
         [
             'full' => '~(\$\w+)=(\'[^\']+\');\s*eval\(gzinflate\(str_rot13\((\$_D)\(\1\)+;~msi',
             'id' => 'undefinedDFunc',
@@ -10078,11 +10643,43 @@ class Deobfuscator
             'id' => 'codeLockDecoder',
         ],
         [
+            'full' => '~(?(DEFINE)(?\'c\'(?:/\*[^\*]+\*/)+))(?&c)if(?&c)\((?&c)isset(?&c)\((?&c)\$_REQUEST(?&c)\[(?:(?&c)*\'\w+\'(?&c)\.?)+\](?&c)\)(?&c)\)(?&c)eval(?&c)\((?&c)stripslashes(?&c)\((?&c)\$_REQUEST(?&c)\[(?:(?&c)*\'\w+\'(?&c)\.?)+\](?&c)\)(?&c)\)(?&c);(?&c)~msi',
+            'id' => 'garbageComments',
+        ],
+        [
             'full' => '~error_reporting\(0\);\s*set_time_limit\(0\);\s*session_start\(\);\s*\$\w+\s*=\s*"[^"]+";(\s*function\s*(\w+)\((\$\w+)\)\{\s*@?((?:\w+\()+)\3(\)+);\s*}\s*(\$\w+)="([^"]+)";\s*\2\(\6\);)~msi',
             'id' => 'agustus1945',
         ],
         [
-            'full' => '~@?eval\(str_rot13\(\s*(["\'])(riny\(pbaireg_hhqrpbqr\((?:[^;]+;)+)\1\s*\)\);~msi',
+            'full' => '~(?:\$\w+=hex2bin\(\'[^\']+\'\);)+(\$\w+)=\$\w+\(\'\',\s*\$\w+\(\'([^\']+)\'\)\);\1\(\);~msi',
+            'id' => 'createFuncHex2Bin',
+        ],
+        [
+            'full' => '~(define\(\'([^\']+)\', \'[^\']+\'\);\$GLOBALS\[\2\]\s*=\s*explode\(\'([^\']+)\',\s*gzinflate\(substr\(\'(.*?)\',([0-9a-fx]+),\s*([\-0-9a-f]+)\)+;.*?)(?:if\(!function_exists\(\$GLOBALS[\{\[]\2[\}\]][\[\{]\d+[\}\]]\)+\{function\s*hex2bin\(\$\w+\)\s*(?:[^}\]]+[\]\}])+\}function\s*(\w+)\((\$\w+)\)\s*\{(?:\8=substr\(\8,\(int\)\(hex2bin\(\$GLOBALS[\{\[]\2[\}\]]\s*[\{\[][0-9a-fx]+[\}\]]\)+[;,]\s*)+\(int\)\(hex2bin\(\$GLOBALS[\{\[]\2[\}\]][\{\[][0-9a-fx]+[\}\]]\)+;return\s*\8;\}(?:\$\w+=\$GLOBALS[\{\[]\2[\}\]][\{\[][0-9a-fx]+[\}\]];)+function\s*(\w+)\((\$\w+)\)\{(?:global\s*\$\w+;)+\s*return\s*strrev\(gzinflate\(\$\w+\(\7\(\10\)+;\s*\}(?:eval\()+\9\(\$GLOBALS[\{\[]\2[\}\]][\{\[][0-9a-fx]+[\}\]]\)+;|((\$\w+)=urldecode\(\$GLOBALS[\{\[]\2[\}\]][\{\[][0-9a-fx]+[\}\]]\);((?:\$\w+\.?=(?:\$\w+[\[\{][0-9a-fx]+[\]\}]\.?)+;)+)eval\(\$\w+\(\$GLOBALS[\{\[]\2[\}\]][\{\[][0-9a-fx]+[\}\]]\)+;))~msi',
+            'id' => 'explodeGzinflateSubstr',
+        ],
+        [
+            'full' => '~eval\(\'\?>\'\.base64_decode\(strtr\(substr\("([^"]+)",(\d+)\*2\),substr\("\1",\2,\2\),\s*substr\("\1",0,\2\)+~msi',
+            'id' => 'evalStrtr',
+        ],
+        [
+            'full' => '~(?:eval\(base64_decode\("[^"]+"\)+;\s*)+eval\(base64_decode\((\w+)\((\$\w+)\[\d\],\d+\)+;eval\((\w+)\(\1\(\2\[\d+\],\d+\),\1\(\2\[\d+\],\d+\),\2\)\);__halt_compiler\(\);([\w\+/=]+)~msi',
+            'id' => 'evalB64Chunks',
+        ],
+        [
+            'full' => '~function\s*(\w+)\(\$\w+,\s*\$\w+\)\s*\{\s*(\$\w+=base64_encode\(\$\w+\);\s*)?(?:\$\w+\s*=\s*(?:strlen|base64_decode)\(\$\w+\);\s*)+(?:if\s*\(\$\w+\s*<=\s*\$\w+\)\s*\{\s*return\s*\$\w+\s*\^\s*\$\w+;\s*\}|(?:\$\w+=(?:""|0);\s*)+while\(\$\w+<strlen\(\$\w+\)+\{)\s*for\s*\(\$\w+\s*=\s*0;\s*\$\w+\s*<\s*(?:strlen\()?\$\w+\)?;\s*(?:\+\+\$\w+|\$\w\+\+)\)\s*\{\s*[^\^]+\^\s*[^}]+[\}\s]+return\s*(base64_decode\()?\$\w+\)?;\s*\}\s*(\$\w+)\s*=\s*"([^"]+)";\s*(\$\w+)\s*=\s*"([^"]+)";\s*(\$\w+)\s*=\s*\1\((?:base64_decode\()?(?:\4|\6)\)?,\s*(?:\4|\6)\);\s*eval\s*\(\8\);~msi',
+            'id' => 'b64FuncEval',
+        ],
+        [
+            'full' => '~(\$\w+)=create_function\(((?:base64_decode\(\'[^\']+\'\)|chr\([0-9a-fx\-/]+\)|str_rot13\(\'[^\']+\'\))\.?,?)+\);\1\(base64_decode\(((?:base64_decode\(\'[^\']+\'\)|chr\([0-9a-fx\-/]+\)|str_rot13\(\'[^\']+\'\)|\'[^\']*\')\.?,?)+\)\);~msi',
+            'id' => 'createFuncB64StrRotChr',
+        ],
+        [
+            'full' => '~error_reporting\(0\);\s*(\$\w+)\s*=\s*fopen\(__FILE__,\s*\'\w\'\);\s*fseek\(\1,\s*\d+\);\s*(\$\w+)\s*=\s*stream_get_contents\(\1\);\s*fclose\(\1\);\s*(\$\w+)\s*=\s*create_function\(\'\',\s*gzuncompress\(strrev\(\2\)\)\);\s*\3\(\);\s*__halt_compiler\(\);\s*(.*)~msi',
+            'id' => 'gzuncompressStrrev',
+        ],
+        [
+            'full' => '~@?(?:eval|assert)\(str_rot13\(\s*(["\'])(riny\((?:pbaireg_hhqrpbqr|fgeeri|tmvasyngr)\((?:[^;]+;)+)\1\s*\)\);~msi',
             'id' => 'strRot13ConvertUUDecode',
         ],
         [
@@ -10126,11 +10723,19 @@ class Deobfuscator
             'id' => 'manyGlobals',
         ],
         [
+            'full' => '~((?:\$GLOBALS\["[^"]+"\]=base64_decode\("[^"]*"\);)+).*?if\(md5\(\$_GET\[\$GLOBALS\["[^"]+"\]\]\).*?echo\s?\$GLOBALS\["[^"]+"\];}+\s?\?>~msi',
+            'id' => 'manyGlobals',
+        ],
+        [
             'full' => '~eval\(\'\$(\w+)\s*=\s*"([^"]+)";\$(\w+)\s*=\s*"([^"]+)";(eval\((?:\w+\()+)(\$\{"\3"\}\s*\.\s*\$\{"\1"})(\)+;)\'\);~msi',
             'id' => 'blackshadow',
         ],
         [
-            'full' => '~(?:\$[^;\s]+\s*=\s*\d;\s*[^;\s]+:\s*if\s*\([^\)]+\)+\s*\{\s*goto\s*[^;\s]+;\s*\}\s*\$[^;\s]+[^:]+:\s*[^;]+;\s*)?goto [^;\s]+;\s*([^;\s]+:\s*([^;\s]+:\s*)?.*?goto\s*[^;\s]+;\s*(}\s*goto\s*[^;\s]+;)?(goto\s*[^;\s]+;)?\s*)+[^;\s]+:\s*[^;>]+;(\s*goto\s*[^;\s]+;\s*[^;\s]+:\s*[^;\s]+:\s*|(?:\s*die;\s*}\s*)?\s*goto\s*[^;\s]+;\s*[^;\s]+:\s*\}?)?(?:(?:.*?goto\s*\w{1,50};)?(?:\s*\w{1,50}:\s?)+)?(?:(?:[^;]+;\s*goto\s*\w+;\s*)+\w+:\s*include\s*[^;]+;)?~msi',
+            'full' => '~goto\s[^;]+;\s?(?:\w{1,50}:\s?)?.*?(?:isset\(\$_SERVER\[)?.*?if\s?\(!@preg_match\("\\\\\w{1,50}.*?\w{1,50}:[\s}]+\?>~msi',
+            'id' => 'goto',
+        ],
+        [
+            'full' => '~(?:\$[^;\s]+\s*=\s*\d;\s*[^;\s]+:\s*if\s*\([^\)]+\)+\s*\{\s*goto\s*[^;\s]+;\s*\}\s*\$[^;\s]+[^:]+:\s*[^;]+;\s*)?goto [^;\s]+;\s*([^;\s]+:\s*([^;\s]+:\s*)?.*?goto\s*[^;\s]+;\s*(}\s*goto\s*[^;\s]+;)?(goto\s*[^;\s]+;)?\s*)+(?:\s*/\*[^\*]+\*/\s*)?[^;\s]+:\s*[^;>]+;(\s*goto\s*[^;\s]+;\s*[^;\s]+:\s*[^;\s]+:\s*|(?:\s*die;\s*}\s*)?\s*goto\s*[^;\s]+;\s*[^;\s]+:\s*\}?)?(?:(?:.*?goto\s*\w{1,50};)?(?:\s*\w{1,50}:\s?)+)?(?:(?:[^;]+;\s*goto\s*\w+;\s*)+\w+:\s*include\s*[^;]+;)?~msi',
             'fast' => '~goto [^;\s]+;\s*([^;\s]+:\s*([^;\s]+:\s*)?.*?goto\s*[^;\s]+;\s*(}\s*goto\s*[^;\s]+;)?(goto\s*[^;\s]+;)?\s*)+[^;\s]+:\s*[^;]+(?:;|\?>)~msi',
             'id' => 'goto',
         ],
@@ -10196,11 +10801,15 @@ class Deobfuscator
             'id'   => 'Bitrix',
         ],
         [
+            'full' => '~\$\w{1,50}\s?=\s?__FILE__;\s?(?:\$\w{1,50}\s?=\s?__LINE__;\s?)?\$\w{1,50}\s?=\s?(\d{1,10});\s?eval\(+((?:base64_decode\(|gzuncompress\()+[\'"][^"\']+[\'"]\)+);\s?return;\s*\?>\s*([^\s]+)~msi',
+            'id' => 'lockit3',
+        ],
+        [
             'full' => '~\$\w{1,40}\s*=\s*(__FILE__|__LINE__);\s*\$\w{1,40}\s*=\s*(\d+);\s*eval(\s*\()+\$?\w+\s*\([\'"][^\'"]+[\'"](\s*\))+;\s*return\s*;\s*\?>(.+)~msi',
             'id'   => 'B64inHTML',
         ],
         [
-            'full' => '~<\?php\s+(?:/[*/].*?)?(?:\$[O0]*=__FILE__;\s*)?(\$[O0]*)=urldecode\(\'([%a-f0-9]+)\'\);(\$(GLOBALS\[\')?[O0]*(\'\])?=(\d+);)?(.*?)(\$(GLOBALS\[\')?[O0]*(\'\])?\.?=(\$(GLOBALS\[\')?[O0]*(\'\])?([{\[]\d+[}\]])?\.?)+;)+([^\?]+)\?\>[\s\w\~=/+\\\\^{`%|@[}]+~msi',
+            'full' => '~<\?php\s+(?:/[*/].*?)?(?:\$[O0]*=__FILE__;\s*)?(\$[O0]*)=urldecode\(\'([%a-f0-9]+)\'\);(\$(GLOBALS\[\')?[O0]*(\'\])?=(\d+);)?(.*?)(\$(GLOBALS\[\')?[O0]*(\'\])?\.?=(\$(GLOBALS\[\')?[O0]*(\'\])?([{\[]\d+[}\]])?\.?)+;)+([^\?]+)\?\>[\s\w\~=/+\\\\^{`%|@[\]}]+~msi',
             'fast' => '~(\$[O0]*)=urldecode\(\'([%a-f0-9]+)\'\);(\$(GLOBALS\[\')?[O0]*(\'\])?=(\d+);)?(.*?)(\$(GLOBALS\[\')?[O0]*(\'\])?\.?=(\$(GLOBALS\[\')?[O0]*(\'\])?([{\[]\d+[}\]])?\.?)+;)+([^\?]+)\?\>[\s\w\~=/+\\\\^{`%|@[}]+~msi',
             'id'   => 'LockIt',
         ],
@@ -10223,7 +10832,7 @@ class Deobfuscator
             'id'   => 'UrlDecode2',
         ],
         [
-            'full' => '~(?:\$\w{1,40}\s?=\s?[\'"]?[\d\w]+[\'"]?;\s*)*()(?|(?:(\$\w{1,40})=[\'"]([^\'"]+)[\'"];\s*)+(?:global\s*\$\w+;\s*)?(\$[\w{1,40}]+)=urldecode\(\2\);|(\$\w{1,40})=urldecode\([\'"]([^\'"]+)[\'"]\);function\s*\w+\([^{]+\{global\s*(\$\w+);)\s*.+?\4(?:.{1,1000}\4[{\[]\d+[}\]]\.?)+?.*?(?:function\s*(\w+)\(\$\w+\s*=\s*\'\'\)\{global\s*\4;@.+\5\(\);|function\s*\w+\(\$\w+,\s*\$\w+,\s*\$\w+\)\s*\{\$\w+\s*[^)]+\)[^}]+;\}|header\((?:\4[\[\{]\d+[\]\}]\.?)+\);})~msi',
+            'full' => '~(?:\$\w{1,40}\s?=\s?[\'"]?[\d\w]+[\'"]?;\s*)*()(?|(?:(\$\w{1,40})\s?=\s?[\'"]([^\'"]+)[\'"];\s*)+(?:global\s*\$\w+;\s*)?(\$[\w{1,40}]+)\s?=\s?urldecode\(\2\);|(\$\w{1,40})\s?=\s?urldecode\([\'"]([^\'"]+)[\'"]\);(?:\s*header\(\'Content-Type:[^\)]+\);\s*(?:\$\w+="\d+";\s*)+)?function\s*\w+\([^{]+\{global\s*(\$\w+);)\s*.+?\4(?:.{1,1000}\4[{\[]\d+[}\]]\.?)+?.*?(?:function\s*(\w+)\(\$\w+\s*=\s*\'\'\)\{global\s*\4;@.+\5\(\);|function\s*\w+\(\$\w+,\s*\$\w+,\s*\$\w+\)\s*\{\$\w+\s*[^)]+\)[^}]+;\}|header\((?:\4[\[\{]\d+[\]\}]\s?\.?\s?)+\).?\s?})~msi',
             'id'   => 'UrlDecode3',
         ],
         [
@@ -10245,6 +10854,22 @@ class Deobfuscator
         [
             'full' => '~\$\w{1,50}\s?=\s?\$\w{1,50}->get\(base64_decode\([\'"][^\'"]+[\'"]\)(?:.*?base64_decode\([\'"][^\'"]+[\'"]\)){1,200}\)\s?\)\s?{~msi',
             'id' => 'manyBase64DecodeContent',
+        ],
+        [
+            'full' => '~\${base64_decode\(\'[^\']+\'\)}\[base64_decode\(\'[^\']+\'\)]\s?=\s?base64_decode\(\'[^\']+\'\);if\(isset\(\$_GET\[base64_decode\(\'[^\']+\'\)]\).*?\${\${base64_decode\(\'[^\']+\'\)}\[base64_decode\(\'[^\']+\'\)]}\(base64_decode\(\'[^\']+\'\)\);exit;}~msi',
+            'id' => 'manyBase64DecodeContent',
+        ],
+        [
+            'full' => '~(?:\$GLOBALS\["[^"]+"\]\s*=\s*base64_decode\s*\((?|"[^"]*"|\'[^\']*\')\);\s*)+function\s*(\w+)\s*\(\$\w+\)\s*\{\s*\$\w+\s*=\s*curl_init\s*\(\$GLOBALS[^}]+\}\s*(\$\w+)\s*=\s*\1\s*\(\$GLOBALS\[[^\)]+\);\s*eval\s*\((?:"[^"]*"\s*\.\s*)?\2\);~msi',
+            'id' => 'manyBase64DecodeContent',
+        ],
+        [
+            'full' => '~(?(DEFINE)(?\'s\'(?:base64_decode\(\'[^\']+\'\))))(?:error_reporting\(0\);\s*ignore_user_abort;\s*sleep\(\d+\);)?\$\w+\s*=\s*\(\(\!empty\(\$_SERVER\[(?&s)\s*\]\)+\s*\?\s*(?&s)\s*:[^;]+;\s*\$\w+\s*=\s*str_replace\((?&s),\s*\'\',\s*\$\w+,\s*\$\w+\);\s*(?:if\s*\(\$\w+\s*==\s*\d+\)\s*\$\w+\s*=\s*(?&s);\s*)+\$\w+\s*=\s*rand\(\d+,\s*\d+\);\s*(?:if\s*\(\$\w+\s*==\s*\d+\)\s*\$\w+\s*=\s*base64_decode\((?&s)\);\s*)+.*?\$\w+\s*=\s*array\((?:(?&s),?\s*)+\);\s*for\s*\([^}]+\}\s*(\$\w+)\s*=\s*basename\(__FILE__,\s*(?&s)\)[^;]+;\s*(\$\w+)\s*=\s*file_get_contents\(\2\);\s*(\$\w+)\s*=\s*fopen\([^;]+;\s*fwrite\(\4,\s*\3\);\s*fclose\(\4\);\s*exec\((?&s)[^;]+;~msi',
+            'id' => 'manyBase64DecodeContent',
+        ],
+        [
+            'full' => '~(?(DEFINE)(?\'s\'(?:base64_decode\((?:\"[^\"]+\"|\'[^\']+\')\))))(?:\$\w+\s*=\s*"\w{32}";|=@?NULL;)(?:\s*(?:(?:\$\{)+(?:(?&s)|\$\w+)\}(?:\[(?&s)\])?\}?|\$\w+)=(?&s);)+\s*eval\(htmlspecialchars_decode\(gzinflate\(base64_decode\(\$\{\$\{(?&s)\}\[(?&s)\]\}\)+;\s*(?:__halt_compiler\(\);)?\s*exit;~msi',
+            'id' => 'manyB64WithVarNorm',
         ],
         [
             'full' => '~explode\(\"\*\*\*\",\s*\$\w+\);\s*eval\(eval\(\"return strrev\(base64_decode\([^\)]+\)+;~msi',
@@ -10360,8 +10985,8 @@ class Deobfuscator
             'id'   => 'zeura',
         ],
         [
-            'full' => '~<\?php\s*(\$\w{1,40})\s*=\s*file\(__FILE__\);\s*function\s(\w{1,50})\((\$\w{1,50}),(\$\w{1,50})\){(\$\w{1,50})=array\(\d+,\d+,\d+,(\d+)\);if\(\4==\d+\){(\$\w{1,50})=substr\(\3,\5\[0\]\+\5\[1\],\5\[2\]\);}elseif\(\4==\d+\){\7=substr\(\3,\5\[0\],\5\[1\]\);}elseif\(\4==\d+\){\7=trim\(substr\(\3,\5\[0\]\+\5\[1\]\+\5\[2\]\)\);}return\7;}eval\(base64_decode\(\2\(\1\[0\],\d+\)\)\);eval\(\w{1,50}\(\2\(\1\[0\],\d+\),\2\(\1\[0\],41\),\1\)\);__halt_compiler\(\);[\w+=/]+~msi',
-            'fast' => '~<\?php\s*(\$\w{1,40})\s*=\s*file\(__FILE__\);\s*function\s(\w{1,50})\((\$\w{1,50}),(\$\w{1,50})\){(\$\w{1,50})=array\(\d+,\d+,\d+,(\d+)\);if\(\4==\d+\){(\$\w{1,50})=substr\(\3,\5\[0\]\+\5\[1\],\5\[2\]\);}elseif\(\4==\d+\){\7=substr\(\3,\5\[0\],\5\[1\]\);}elseif\(\4==\d+\){\7=trim\(substr\(\3,\5\[0\]\+\5\[1\]\+\5\[2\]\)\);}return\7;}eval\(base64_decode\(\2\(\1\[0\],\d+\)\)\);eval\(\w{1,50}\(\2\(\1\[0\],\d+\),\2\(\1\[0\],41\),\1\)\);__halt_compiler\(\);~msi',
+            'full' => '~<\?php(?:\s*/\*.*?\*/)?\s*(\$\w{1,40})\s*=\s*file\(__FILE__\);\s*function\s(\w{1,50})\((\$\w{1,50}),(\$\w{1,50})\){(\$\w{1,50})=array\(\d+,\d+,\d+,(\d+)\);if\(\4==\d+\){(\$\w{1,50})=substr\(\3,\5\[0\]\+\5\[1\],\5\[2\]\);}elseif\(\4==\d+\){\7=substr\(\3,\5\[0\],\5\[1\]\);}elseif\(\4==\d+\){\7=trim\(substr\(\3,\5\[0\]\+\5\[1\]\+\5\[2\]\)\);}return\7;}eval\(base64_decode\(\2\(\1\[0\],\d+\)\)\);eval\(\w{1,50}\(\2\(\1\[0\],\d+\),\2\(\1\[0\],\d+\),\1\)\);__halt_compiler\(\);[\w+=/]+~msi',
+            'fast' => '~<\?php(?:\s*/\*.*?\*/)?\s*(\$\w{1,40})\s*=\s*file\(__FILE__\);\s*function\s(\w{1,50})\((\$\w{1,50}),(\$\w{1,50})\){(\$\w{1,50})=array\(\d+,\d+,\d+,(\d+)\);if\(\4==\d+\){(\$\w{1,50})=substr\(\3,\5\[0\]\+\5\[1\],\5\[2\]\);}elseif\(\4==\d+\){\7=substr\(\3,\5\[0\],\5\[1\]\);}elseif\(\4==\d+\){\7=trim\(substr\(\3,\5\[0\]\+\5\[1\]\+\5\[2\]\)\);}return\7;}eval\(base64_decode\(\2\(\1\[0\],\d+\)\)\);eval\(\w{1,50}\(\2\(\1\[0\],\d+\),\2\(\1\[0\],\d+\),\1\)\);__halt_compiler\(\);~msi',
             'id'   => 'zeuraFourArgs',
         ],
         [
@@ -10378,12 +11003,16 @@ class Deobfuscator
             'id'   => 'evalConcatedVars',
         ],
         [
-            'full' => '~(\$\{"[\\\\x47c2153fGLOBALS]+"\}\["[\w\\\\]+"\]="[\w\\\\]+";(\$\w+="\w+";)?){5,}.+\$\{"[\\\\x47c2153fGLOBALS]+"\}\["[\w\\\\]+"\].+?}+(?:exit;}+if\(@?file_exists\("[^"]+"\)+{include\("[^"]+"\);\}|==\(string\)\$\{\$\w+\}\)\s*\{\$\w+="[^"]+";\$\w+="[^"]+";\$\{\$\w+\}\.=\$\{\$\w+\};break;\}+eval\("[^"]+"\.gzinflate\(base64_decode\(\$\{\$\{"[^"]+"\}\["[^"]+"\]\}\)+;|\["[^"]+"\]\}\);)?~msi',
+            'full' => '~(\$\{"[\\\\x47c2153fGLOBALS]+"\}\["[\w\\\\]+"\]="[\w\\\\]+";(\$\w+="\w+";)?){5,}.+\$\{"[\\\\x47c2153fGLOBALS]+"\}\["[\w\\\\]+"\].+?}+(?:exit;}+if\(@?file_exists\("[^"]+"\)+{include\("[^"]+"\);\}|==\(string\)\$\{\$\w+\}\)\s*\{\$\w+="[^"]+";\$\w+="[^"]+";\$\{\$\w+\}\.=\$\{\$\w+\};break;\}+eval\("[^"]+"\.gzinflate\(base64_decode\(\$\{\$\{"[^"]+"\}\["[^"]+"\]\}\)+;|\["[^"]+"\]\}\);|\)\)\{[^;]+;ob_clean\(\);[^\.]+\.urlencode\(\$\{\$\w+\}\)+;\}+)?~msi',
             'id'   => 'Obf_20200618_1',
         ],
         [
             'full' => '~(\$\w+\s?=\s?(\w+)\(\'\d+\'\);\s*)+\$\w+\s?=\s?new\s?\$\w+\(\2\(\'(\d+)\'\)+;\s?error_reporting\(0\);\s?eval\(\$\w+\(\$\w+->\$\w+\("([^"]+)"\)+;.+?function \2.+?return\s\$\w+;\s}~msi',
             'id'   => 'aanKFM',
+        ],
+        [
+            'full' => '~(?:\$\w{1,500}\s*=\s*[\'"][^\'"]+[\'"];)+(?:\$\w{1,500}\s*=\s*\$\w{1,500}\s?\.\s?[\'"]{2}\s?\.\s?\$\w{1,500};)+(?:\$\w{1,500}\s?=\s?(?:str_rot13|base64_decode|gzinflate)\(\$\w{1,500}\);)+\s*eval\(\$\w{1,500}\);~msi',
+            'id' => 'longVarConcatStrRot13B64Gz',
         ],
         [
             'full' => '~error_reporting\(\d\);@?set_time_limit\(\d\);(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];(\$\w{1,50})\s?=\s?[\'"]([^\'"]{0,100})[\'"];(\$\w{1,50}\s?=\s?[\'"][^\'"]{0,500}[\'"];)eval\(gzinflate\(base64_decode\(\3\)\)\);rebirth\(\);eval\(gzinflate\(base64_decode\(hate\(\1,\5\){4};~msi',
@@ -10411,7 +11040,11 @@ class Deobfuscator
             'id'   => 'evalVarReplace',
         ],
         [
-            'full' => '~((\$[^\s=.;]+)\s*=\s*\(?[\'"]([^\'"]+)[\'"]\)?\s*;?\s*)+\s*.{0,10}?(?:error_reporting\(\d\);|@set_time_limit\(\d\);|@|ini_set\([\'"]\w{1,99}[\'"],\s?\d\);\s?){0,5}(?:eval\s*\(|assert\s*\(|echo)\s*([\'"?>.\s]+)?\(?(base64_decode\s*\(|gzinflate\s*\(|strrev\s*\(|str_rot13\s*\(|gzuncompress\s*\(|urldecode\s*\(|rawurldecode\s*\(|htmlspecialchars_decode\s*\(|convert_uudecode\s*\()+(\({0,1}[\s"\']?(\$[^\s=\'")]+)?(?:str_replace\((?:.+?,){3}\2?)?[\s"\']?\){0,1})(?:[\'"]?\)+;)+~msi',
+            'full' => '~(?:\$\w{1,50}\s*=\s*base64_decode\((?:[\'"][^\'"]+[\'"]\.?)+\);)+\s*(?:\$\w{1,50}\s*=\s*[\'"][^\'"]+[\'"];)+\s*(eval\(htmlspecialchars_decode\((?:\$\w{1,50}\(?)+\)+;)~msi',
+            'id' => 'evalVarsB64Concated',
+        ],
+        [
+            'full' => '~((\$[^\s=.;]+)\s*=\s*\(?[\'"]([^\'"]+)[\'"]\)?\s*;?\s*)+\s*.{0,10}?(?:error_reporting\(\d\);|@set_time_limit\(\d\);|@|ini_set\([\'"]\w{1,99}[\'"],\s?\d\);\s?){0,5}(?:eval\s*\(|assert\s*\(|echo)\s*([\'"?>.\s]+)?\(?(base64_decode\s*\(|gzinflate\s*\(|strrev\s*\(|str_rot13\s*\(|gzuncompress\s*\(|urldecode\s*\(|rawurldecode\s*\(|htmlspecialchars_decode\s*\(|convert_uudecode\s*\()+(\({0,1}[\s"\']?(\$[^\s=\'")]+)?(?:str_replace\((?:.+?,){3}\2?)?[\s"\']?\){0,1})(?:[\'"]?\)+;?)+~msi',
             'id'   => 'evalVar',
         ],
         [
@@ -10451,6 +11084,18 @@ class Deobfuscator
         [
             'full' => '~(\$\w{1,50})=[\'"]([^\'"]+)[\'"];\s?\1\s?=\s?base64_decode\(\1\);\s?eval\(gzinflate\(str_rot13\(\1\)+;~msi',
             'id' => 'evalGzStrRotB64',
+        ],
+        [
+            'full' => '~(\$\w{1,50})\s*=\s*([\'"][^\'"]+[\'"]);\s*eval\(urldecode\(hex2bin\([\'"]([^\'"]+)[\'"]\)\)\);\s*eval\(hex2bin\([\'"]([^\'"]+)[\'"]\)\s*\.\s*((?:\$\w{1,50}\()+\1)\)+;~msi',
+            'id' => 'twoEvalVarsReplace',
+        ],
+        [
+            'full' => '~global\s?(\$\w{1,50});\s?if\(!\1\)\s?{\s?function\sob_start_flush\((\$\w{1,50})\)\s?{\s?(\$\w{1,50})\s?=\s?array\(((?:\d{1,5}[,\s]*)+)\);\s?(\$\w{1,50})\s?=\s?array\(((?:\d{1,5}[,\s]*)+)\);\s?(\$\w{1,50})\s?=\s?[\'"]{2};\s?foreach\(\5\sas\s(\$\w{1,50})\)\s?{\s?\7\s?\.=\s?chr\(\3\[\8\]\+(\d{1,5})\);\s?}.*?\7\.substr\(.*?[\'"]ob_start_flush[\'"]\);\s?}\s?\?>~msi',
+            'id' => 'obStartFlushVar',
+        ],
+        [
+            'full' => '~((?:\$GLOBALS\[[\'"][^\'"]+[\'"]\]\s?=\s?base64_decode\([\'"][^\'"]*[\'"]\);){10,})(?:.*?\$GLOBALS\[[\'"][^\'"]+[\'"]\])+[);]*~msi',
+            'id' => 'b64GlobalVarsReplace',
         ],
         [
             'full' => '~(preg_replace\(["\'](?:/\.\*?/[^"\']+|[\\\\x0-9a-f]+)["\']\s*,\s*)[^\),]+(?:[\)\\\\0-5]+;[\'"])?(,\s*["\'][^"\']*["\'])\)+;~msi',
@@ -10511,6 +11156,14 @@ class Deobfuscator
             'id'   => 'evalEscapedCharsContent',
         ],
         [
+            'full' => '~eval\(strrev\(\s?\'([^\']+)\'\s?\)\);~msi',
+            'id' => 'evalStrrevCode',
+        ],
+        [
+            'full' => '~eval\(convert_uudecode\(\s?\'((?:.*?\\\\\')*[^\']+)\'\)\);~msi',
+            'id' => 'evalConvertUudecodeWithSlashedQuote',
+        ],
+        [
             'full' => '~@?(eval|echo|(\$\w+)\s*=\s*create_function)(?:\/\*+\/)?\s*\((\'\',)?\s*([\'"][?>\s]+[\'".\s]+)?\s*\(?\s*@?\s*(?:base64_decode\s*\(|pack\s*\(\'H\*\',|convert_uudecode\s*\(|htmlspecialchars_decode\s*\(|gzdecode\s*\(|stripslashes\s*\(|gzinflate\s*\(|strrev\s*\(|str_rot13\s*\(|gzuncompress\s*\(|urldecode\s*\(|rawurldecode\s*\(|unserialize\s*\(|eval\s*\(|hex2bin\()+.*?[^\'");]+((\s*\.?[\'"]([^\'";]+[\'"]*\s*)+|,\s*true)?\s*[\'"\)]+)+\s*;?(\s*\2\(\);)?~msi',
             'id'   => 'eval',
         ],
@@ -10520,7 +11173,15 @@ class Deobfuscator
             'id'   => 'eval',
         ],
         [
-            'full' => '~((?:\$\w+\s?=\s?(?:base64_decode|str_rot13)\([\'"][^\'"]+[\'"]\);)+)\s?(@?eval\((?:(?:\w+\()*\$\w+\(?)+(?:.*?)?\)+;)~msi',
+            'full' => '~(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];\s?(\$\w{1,50})\s?=\s?base64_decode\([\'"]([^\'"]+)[\'"]\);\s?eval\(\3\(\3\([\'"]\1[\'"]\)\)\);~msi',
+            'id' => 'evalB64DoubleVar',
+        ],
+        [
+            'full' => '~((\$\w+)="";\$\w+\s*\.=\s*"[^;]+;\s*)+(?:(?:\$\w+)?="";)?eval\((\s*\$\w+\s*\.)+\s*"[^"]+(?:"\);)+~msi',
+            'id'   => 'evalConcatVars',
+        ],
+        [
+            'full' => '~((?:\$\w+\s?=\s?(?:[base_decode\."\'\d /\*\+\-]+|str_rot13)(?:\([\'"][^\'"]+[\'"]\))?;)+)\s*(@?eval\((?:[\'"\)]\?>[\'"\)]\s*\.\s*)*(?:(?:\w+\()*\$\w+\(?)+(?:.*?)?\)+;)~msi',
             'id'   => 'evalFuncVars',
         ],
         [
@@ -10602,7 +11263,7 @@ class Deobfuscator
             'id'   => 'anaski',
         ],
         [
-            'full' => '~\$\w+="[^"]+";\$l+=0;\$l+=\'base64_decode\';\$l+=0;eval\([^\^]+\^[\dx]+\);}eval\(\$l+\("[^"]+"\)+;eval\(\$l+\);return;~msi',
+            'full' => '~\$\w+="([^"]+)";(?:\$l+=0;\$l+=\'base64_decode\';\$l+=0;eval\(\$l+\("[^"]+"\)+;|\$l+=\'ord\';)[^\^]+\^[\dx]+\);}eval\(\$l+\("[^"]+"\)+;eval\(\$l+\);return;~msi',
             'id'   => 'custom1',
         ],
         [
@@ -10647,10 +11308,6 @@ class Deobfuscator
             'full' => '~(\$\w+)\s*=\s*(base64_decode\s*\(+|gzinflate\s*\(+|strrev\s*\(+|str_rot13\s*\(+|gzuncompress\s*\(+|convert_uudecode\s*\(+|urldecode\s*\(+|rawurldecode\s*\(+|htmlspecialchars_decode\s*\(+)+"([^"]+)"\)+;\s*@?eval\(([\'"?>.\s]+)?\1\);~',
             'fast' => '~(\$\w+)\s*=\s*(base64_decode\s*\(+|gzinflate\s*\(+|strrev\s*\(+|str_rot13\s*\(+|gzuncompress\s*\(+|convert_uudecode\s*\(+|urldecode\s*\(+|rawurldecode\s*\(+|htmlspecialchars_decode\s*\(+)+"([^"]+)"\)+;\s*@?eval\(([\'"?>.\s]+)?\1\);~',
             'id'   => 'varFuncsEval',
-        ],
-        [
-            'full' => '~((\$\w+)="";\$\w+\s*\.=\s*"[^;]+;\s*)+(?:(?:\$\w+)?="";)?eval\((\s*\$\w+\s*\.)+\s*"[^"]+(?:"\);)+~msi',
-            'id'   => 'evalConcatVars',
         ],
         [
             'full' => '~<\?php\s*defined\(\'[^\']+\'\)\s*\|\|\s*define\(\'[^\']+\',__FILE__\);(global\s*\$[^;]+;)+\s*(if\(!function_exists\(\'([^\']+)\'\)\){\s*function\s*[^\)]+\(\$[^,]+,\$[^=]+=\'\'\){\s*if\(empty\(\$[^\)]+\)\)\s*return\s*\'\';\s*\$[^=]+=base64_decode\(\$[^\)]+\);\s*if\(\$[^=]+==\'\'\)\s*return\s*\~\$[^;]+;\s*if\(\$[^=]+==\'-1\'\)\s*@[^\(]+\(\);\s*\$[^=]+=\$GLOBALS\[\'[^\']+\'\]\[\'[^\']+\'\]\(\$[^\)]+\);\s*\$[^=]+=\$GLOBALS\[\'[^\']+\'\]\[\'[^\']+\'\]\(\$[^,]+,\$[^,]+,\$[^\)]+\);\s*return\s*\$[^^]+\^\$[^;]+;\s*}}\s*)+(\$[^\[]+\["[^"]+"]=[^\(]+\(\'[^\']+\',\'[^\']*\'\);\s*)+(\$[^\[]+\[\'[^\']+\'\]=\$GLOBALS\[\'[^\']+\'\]\[\'[^\']+\'\]\([^\)]*\)+;\s*)+return\(eval\(\$[^\[]+\[\'[^\']+\'\]\)+;\s*\?>\s*#!/usr/bin/php\s*-q\s*(\s*[^\s]+)+~msi',
@@ -10699,7 +11356,7 @@ class Deobfuscator
             'id'   => 'Obf_20200507_5',
         ],
         [
-            'full' => '~parse_str\s*\(\'([^\']+)\'\s*,\s*(\$\w+)\)\s*;(\2\s*\[\s*\d+\s*\]\s*\(\s*)+\'[^\']+\'\s*\),\s*array\(\s*\),\s*array\s*\(\s*\'[^\']+\'\s*\.(\2\[\s*\d+\s*\]\()+\'([^\']+)\'\s*[\)\s]+\.\'//\'[\s\)]+;~msi',
+            'full' => '~parse_str\s*\(\s*((?:[\'"][^\'"]+["\']\s*\.?\s*)+)\s*,\s*(\$\w+)\s*\)\s*;\s*@?\s*(\2\s*\[\s*\d+\s*\]\s*\(\s*)+(?:\'[^\']+\'|\2\[\d+\])\s*\)?,\s*array\s*\(\s*\)\s*,\s*array\s*\(\s*["\'][^\'"]+[\'"]\s*\.\s*(\2\[\s*\d+\s*\]\s*\(\s*)+[\'"]([^\'"]+)[\'"]\s*[\)\s]+\.[\'"]//[\'"][\s\)]+;~msi',
             'id'   => 'Obf_20200513_1',
         ],
         [
@@ -10727,11 +11384,11 @@ class Deobfuscator
             'id'   => 'bypass',
         ],
         [
-            'full' => '~(?:\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";)+(echo)\s*"(?:[<\w\\\\>\/\s={:}#]+);(?:[\\\\\w\-:]+;)+(?:[\\\\\w}:{\s#]+;)+(?:[\\\\\w}:{#\-\s]+;)+[\\\\\w}<\/]+";\$\w+=["\\\\\w]+;(?:\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";)+\$\w+=["\\\\\w]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";error_reporting\(\d\);\$\w+=["\\\\\w]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\$\w+=["\\\\\w]+;set_time_limit\(\d\);\$\w+=["\\\\\w]+;(?:\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";)+(if\(empty\()[\$_\w\["\\\\\]]+\)\){\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\w()]+;(}else{)\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;}chdir\(\${\$\w+}\);\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=htmlentities\(\$[_\w\["\\\\\].?]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\);\1[<\\\\\w>\/"]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";(?:\$\w+=["\w\\\\]+;)+(?:\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;)+\$\w+=["\w\\\\]+;\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1["\\\\\w<>=\s\'.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\\\\\w=\s\/<>]+;(?:\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";)+\1["<\\\\\w\s\'.\${}>\/]+;\1["<\\\\\w>\s\'.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."&\w\\\\\'<\/]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\$\w+=["\\\\\w]+;\1["<\\\\\w>\s=\'.\${}&\/]+;(?:\1["<\\\\\w>\/]+;)+\$\w+=["\\\\\w]+;\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";switch\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\){case"[\w\\\\\s]+":(?:\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;)+\2\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){(?:\$\w+=["\\\\\w]+;)+(?:\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";)+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=fopen\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]},"\w"\);\$\w+=["\\\\\w]+;\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=(?:(?|fread|filesize)\(\${\$\w+},?)+\)\);\${\$\w+}=str_replace\("[\w\\\\\s]+",[<\w\\\\>"]+,\${\$\w+}\);\1["\\\\\w<>=\s\'.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\\\\\w=\s\/<>&\${}\']+;\1["\\\\\w\s.:]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\."[\w\\\\\s]+";\1["\\\\\w\s\'=]+\.\${\$\w+}\.["<\w\\\\>]+;\1["<\\\\\w>\s=\'\/;]+\3\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";(?:\$\w+=["\w\\\\]+;)+\${\$\w+}=fopen\(\${\$\w+},"\w"\);if\(fwrite\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]},\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\s\\\\\w]+;\3\1["\\\\\w\s.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\\\\\w]+;}}fclose\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\);(break;case")[\w\\\\\s]+":\${\$\w+}=[\$_\w\["\]\\\\]+;if\(unlink\([\${}\w]+\)\){\1\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\.["\s\w\\\\.>]+;\3\$\w+=["\w\\\\]+;\1["\\\\\w\s.${}<]+;}\4[\w\\\\\s]+":(?:\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;)+\2\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1["<\w\\\\\s=.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}.["\\\\\w&.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\\\\\w\s=]+;(?:\1["\w\\\\:\s\'><=\/]+;)+\3(?:\$\w+=["\w\\\\]+;)+if\(copy\(\${\$\w+},\${\$\w+}\)\){\1"[\w\\\\\s]+";\3\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1"[\w\\\\\s]+"\.\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\w>\\\\=&]+;}}\4[\w\\\\\s]+":(?:\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;)+\2\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\1"[\w\\\\\s]+"\.\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\w>\\\\=&]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\'\\\\\w\s=>]+;\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;\1["\\\\\w\s\'=>\/;]+\3if\(rename\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]},\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;\3\$\w+=["\w\\\\]+;\1"[\w\\\\\s]+"\.\${\$\w+}[."\\\\\w>;]+}}\4[\w\\\\\s]+":\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;\${\$\w+}=[\$_\w\["\]\\\\]+;\2\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1["\\\\\w\s\'.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\.["\\\\\w=.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\.["\\\\\w\s>]+;(?:\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;)+\1["\\\\\w\s=\'<\/;]+\3if\(rename\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]},\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;\3\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1"[\w\\\\\s]+"\.\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\w>\\\\=&]+;}}\4[\w\\\\\s]+":\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;if\(rmdir\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;\3\$\w+=["\\\\\w]+;\1"[\w\\\\\s]+"\.\${\$\w+}[."\\\\\w]+;}\4[\w\\\\\s]+":\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;\2\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;)+\3\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";system\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\);}\4[\w\\\\\s]+":\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;\2\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\$\w+=["\w\\\\]+;(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;)+\3\$\w+=["\w\\\\]+;if\(\${\$\w+}=fopen\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]},"\w"\)\){\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;\3\$\w+=["\w\\\\]+;\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;}\$\w+=["\w\\\\]+;fclose\(\${\$\w+}\);}\4[\w\\\\\s]+":\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=[\$_\w\["\\\\\]]+;\${\$\w+}=basename\([\$_\w\["\\\\\]]+\);\2\${\$\w+}\)\){\1["<\\\\\w\s=\'.]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\.["&\w\\\\\s=\/\-\'>]+;(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;)+\3\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";if\(move_uploaded_file\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]},\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;unlink\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\);\3\1"[\w\\\\\s]+"\.\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\w>\\\\=&]+;}}\4[\w\\\\\s]+":\${\$\w+}=[\$_\w\["\]\\\\]+;\2\${\$\w+}\)\){(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;)+\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;\3\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\$\w+=["\\\\\w]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=explode\(":",\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\);if\(\(!is_numeric\(\${\$\w+}\[\d\]\)\)or\(!is_numeric\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\[\d\]\)\)\){\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;\3(?:\$\w+=["\w\\\\]+;)+\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\$\w+=["\w\\\\]+;(?:\${\$\w+}=\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\[\d\];)+\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;while\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}<=\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\){\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\$\w+=["\\\\\w]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=\d;\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=fsockopen\(\$\w+,\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)or\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=\d;if\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}==\d\){\$\w+=["\\\\\w]+;echo\${\$\w+}\.["\\\\\w>]+;}\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\+\+;fclose\(\${\$\w+}\);}}}break;}clearstatcache\(\);(?:\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;){2}\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=scandir\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\);foreach\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\s\w+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\){if\(is_file\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\){(?:\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";)+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=round\(filesize\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\/\d+,\d\);\$\w+=["\w\\\\]+;\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1["<\\\\\w>.\s=]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\/\w\\\\>;]+\$\w+=["\\\\\w]+;\1["<\\\\\w>.\s=]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\\\\\w\s<\/>]+;\1["<\\\\\w>.\s=]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\\\\\w=&]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\\\\\w\/<>;]+\$\w+=["\\\\\w]+;\1"[\w\\\\\s]+"\.\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\w>\\\\=&]+\${\$\w+}[.">\w\\\\\/<]+;(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;)+\3(?:\$\w+=["\\\\\w]+;){2}\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=scandir\(\${\$\w+}\);(?:\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";){2}\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}=count\(\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}\)\-\d;\1"[\w\\\\\s]+"\.\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."<\w>\\\\=&]+\/\w+>";\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]="[\w\\\\\s]+";\1["<\\\\\w>.\s=]+\${\${"[\w\\\\\s]+"}\["[\w\\\\\s]+"\]}[."\\\\\w\s=<\/]+;(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;){3}}}\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;~msi',
+            'full' => '~(?:\${"[^"]+"}\["[^"]+"\]="[^"]+";)+(echo)\s*"(?:[<\w\\\\>\/\s={:}#]+);(?:[\\\\\w\-:]+;)+(?:[\\\\\w}:{\s#]+;)+(?:[\\\\\w}:{#\-\s]+;)+[\\\\\w}<\/]+";\$\w+=["\\\\\w]+;(?:\${"[^"]+"}\["[^"]+"\]="[^"]+";)+\$\w+=["\\\\\w]+;\${"[^"]+"}\["[^"]+"\]="[^"]+";error_reporting\(\d\);\$\w+=["\\\\\w]+;\${"[^"]+"}\["[^"]+"\]="[^"]+";\$\w+=["\\\\\w]+;set_time_limit\(\d\);\$\w+=["\\\\\w]+;(?:\${"[^"]+"}\["[^"]+"\]="[^"]+";)+if\(empty\([\$_\w\["\\\\\]]+\)\){\${\${"[^"]+"}\["[^"]+"\]}=[\w()]+;}else{\${\${"[^"]+"}\["[^"]+"\]}=[\$_\w\["\\\\\]]+;}chdir\(\${\$\w+}\);\${\${"[^"]+"}\["[^"]+"\]}=htmlentities.*?\1"[^"]+"\.\${\${"[^"]+"}\["[^"]+"\]}[."<\w>\\\\=&]+\${\$\w+}[.">\w\\\\\/<]+;(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;)+}else{(?:\$\w+=["\\\\\w]+;){2}\${\${"[^"]+"}\["[^"]+"\]}=scandir\(\${\$\w+}\);(?:\${"[^"]+"}\["[^"]+"\]="[^"]+";){2}\${\${"[^"]+"}\["[^"]+"\]}=count\(\${\${"[^"]+"}\["[^"]+"\]}\)\-\d;\1"[^"]+"\.\${\${"[^"]+"}\["[^"]+"\]}[."<\w>\\\\=&]+\/\w+>";\${"[^"]+"}\["[^"]+"\]="[^"]+";\1["<\\\\\w>.\s=]+\${\${"[^"]+"}\["[^"]+"\]}[."\\\\\w\s=<\/]+;(?:\1["\\\\\w\s=.\${}\[\]&\':\/<>]+;){3}}}\1["\\\\\w:\s.\$\[\]>()_\'<\/%]+;~msi',
             'id'   => 'darkShell',
         ],
         [
-            'full' => '~(\$\w+)=\'([\w\(;\$\)=\s\[\/\]."*]+)\';(\$\w+)=(?:\1\[[-+\(\d*\/\)]+\]\.?)+;(\$\w+)=(?:\1\[[-+\(\d*\/\)]+\]\.?)+;(\$\w+)=(?:\1\[[-+\(\d*\/\)]+\]\.?)+;(\$\w+)=\s+"([\'\w\/+=]+)";(\$\w+)\.=\4;\8\.=\6;\8\.=\5;@(\$\w+)=\3\(\(\'+\),\s+\(\8\)\);@\9\(\);~msi',
+            'full' => '~((\$\w+)=\'(\d+)\';)?(\$\w+)=\'([\w\(;\$\)=\s\[\/\]."*,{}]+)\';(\$\w+)=(?:\4\[[-+\(\d*\/\)]+\]\.?)+;(\$\w+)=(?:\4\[[-+\(\d*\/\)]+\]\.?)+;(\$\w+)=(?:\4\[[-+\(\d*\/\)]+\]\.?(?(2)\2\.|)?)+;(\$\w+)=\s*"([\'\w\/+=]+)";(?:\$\w+=\'\';)?(\$\w+)\.=\7;\11\.=\9;\11\.=\8;@(\$\w+)=\6\(\(\'+\),\s+\(\11\)\);@\12\(\);~msi',
             'id'   => 'wso',
         ],
         [
@@ -10792,7 +11449,7 @@ class Deobfuscator
             'id'   => 'wsoFunc',
         ],
         [
-            'full' => '~function\s(\w+)\((\$\w+)\)\s{0,50}{\s{0,50}\2=gzinflate\(base64_decode\(\2\)\);\s{0,50}for\((\$\w+)=\d+;\3<strlen\(\2\);\3\+\+\)\s{0,50}{\s{0,50}\2\[\3\]\s?=\s?chr\(ord\(\2\[\3\]\)-(\d+)\);\s{0,50}}\s{0,50}return\s?\2;\s{0,50}}\s{0,50}eval\(\1\([\'"]([\w\+\/=]+)[\'"]\)\);~msi',
+            'full' => '~function\s(\w+)\((\$\w+)\)\s{0,50}{\s{0,50}\2\s?=\s?gzinflate\(base64_decode\(\2\)\);\s{0,50}for\s?\(\s?(\$\w+)\s?=\s?\d+\s?;\s?\3\s?<\s?strlen\(\2\);\s?\3\+\+\)\s{0,50}{\s{0,50}\2\[\3\]\s?=\s?chr\(ord\(\2\[\3\]\)\s?-\s?(\d+)\);\s{0,50}}\s{0,50}return\s?\2;\s{0,50}}\s{0,50}eval\(\1\([\'"]([^\'"]+)[\'"]\)\);~msi',
             'id'   => 'evalWanFunc',
         ],
         [
@@ -10800,7 +11457,7 @@ class Deobfuscator
             'id'   => 'funcFile',
         ],
         [
-                'full' => '~(\$(?:GLOBALS\[\')?\w+(?:\'\])?\s{0,100}=\s{0,100}array\(\s{0,100}(?:\s{0,100}\'[^\']+\'\s{0,100}=>\s{0,100}\'?[^\']+\'?,\s{0,100})+\s{0,100}\);\s{0,100}((?:\$\w+=(?:[\'"][^\'"]*[\'"]\.?)+;)+)?(?:if\(!\$?\w+\((?:\'\w*\'\.?|\$\w+)+\)\){function\s{0,100}\w+\(\$\w+\){.*?else{function\s{0,100}\w+\(\$\w+\){.*?return\s{0,100}\$\w+\(\$\w+\);\s?}}){2})\$\w+=(?:\'\w*\'\.?)+;\s?(\$\w+)\s{0,100}=\s{0,100}@?\$\w+\(\'\$\w+\',(?:\$\w+\.\'\(.\.\$\w+\.(?:\'[\w(\$);]*\'\.?)+\)|(?:\'[^\']+\'\.?)+\));.*?\3\([\'"]([^"\']+)[\'"]\);~msi',
+            'full' => '~(\$(?:GLOBALS\[\')?\w+(?:\'\])?\s{0,100}=\s{0,100}array\(\s{0,100}(?:\s{0,100}\'[^\']+\'\s{0,100}=>\s{0,100}\'?[^\']+\'?,\s{0,100})+\s{0,100}\);\s{0,100}((?:\$\w+=(?:[\'"][^\'"]*[\'"]\.?)+;)+)?(?:if\(!\$?\w+\((?:\'\w*\'\.?|\$\w+)+\)\){function\s{0,100}\w+\(\$\w+\){.*?else{function\s{0,100}\w+\(\$\w+\){.*?return\s{0,100}\$\w+\(\$\w+\);\s?}}){2})\$\w+=(?:\'\w*\'\.?)+;\s?(\$\w+)\s{0,100}=\s{0,100}@?\$\w+\(\'\$\w+\',(?:\$\w+\.\'\(.\.\$\w+\.(?:\'[\w(\$);]*\'\.?)+\)|(?:\'[^\']+\'\.?)+\));.*?\3\([\'"]([^"\']+)[\'"]\);~msi',
             'id'   => 'gulf',
         ],
         [
@@ -10828,8 +11485,12 @@ class Deobfuscator
             'id'   => 'createFuncEval',
         ],
         [
-            'full' => '~((\$\w+)="([\w-]+)";\s*(?:\$\w+=\'\d+\';\s*)*\s*((?:\$\w+=(?:\2{\d+}\.?)+;)+)+)(?:header[^\)]+\);)?(?:\$\w+=)?(\$\{"[GLOBALSx0-9a-f\\\\]+"})(.+?((.+?\5).+?)+)"[^"]+"\]\(\);~msi',
+            'full' => '~((\$\w+)=((?:base64_decode\(|urldecode\()?"[\w=\-%]+"(?:\)?));\s*(?:\$\w+=\'\d+\';\s*)*\s*((?:\$\w+=(?:\2{\d+}\.?)+;)+)+)(?:header[^\)]+\);)?(?:\$\w+=)?(\$\{"[GLOBALSx0-9a-f\\\\]+"})(.+?((.+?\5).+?)+)"[^"]+"\]\(\);~msi',
             'id'   => 'dictionaryCreateFuncs',
+        ],
+        [
+            'full' => '~error_reporting\(\d\);header\([^\)]+\);\$\w+\s*=\s*\d+;(\$\w+)="([^"]+)";(\1=str_replace\("([^"]+)","",\1\);(\$\w+)=base64_decode\(\1\));((?:.{1,150}?\5\{\d+\})+\)\s*or\s*die\(\'[^\']+\'\);fwrite\(\$\w+,\s*\$\w+\);fclose\(\$\w+\);\})~msi',
+            'id'   => 'dictionaryStrReplace',
         ],
         [
             'full' => '~(\$\w+)\s?=\s?"([\w\s=]+)";\s?(\$\w+)\s?=\s?array\(((?:\d+,?\s?)+)\);\s?(\$\w+)\s?=\s?array\(((?:"[\w\d\s\/\.]+",?\s?)+)\);\s?(\$\w+)\s?=\s?\'\';\s?(?:\$\w+\s=(?:\s?\5\[\d+\]\s?\.?)+;\s?)+(\$\w+)\s?=\s?\$\w+\("\\\\r\\\\n",\s?\1\);\s?for\((\$\w+)=0;\9\s?<\s?sizeof\(\8\);\9\+\+\){\s?\7\s\.=\s?\$\w+\(\8\[\9\]\);\s?}\s?\1\s?=\s?\7;\s?(\$\w+)\s?=\s?\3;\s?(\$\w+)\s?=\s?"";\s?for\((\$\w+)=0;\s?\12<sizeof\(\10\);\s?\12\+=2\){\s?if\(\12\s?%\s?4\){\s?\11\.=\s?substr\(\1,\10\[\12\],\10\[\12\+1\]\);\s?}else{\s?\11\.=strrev\(substr\(\1,\10\[\12\],\10\[\12\+1\]\)\);\s?}\s?};\s?\1\s?=\s?\$\w+\(\11\);\s(\$\w+)\s?=\s?array\(\);\s?(\$\w+)\s?=\s?(?:\5\[\d+\]\s?\.?\s?;?)+;\s?(\$\w+)\s?=\s?(?:\5\[\d+\]\s?\.?\s?)+;\s?(\$\w+)\s?=\s?\'\';\s?for\((\$\w+)=0;\s?\17<strlen\(\1\);\s?\17\+=32\){\s?\13\[\]\s?=\s?substr\(\1,\s?\17,\s?32\);\s?}\s?(?:\$\w+\s?=\s?(?:\5\[\d+\]\s?\.?\s?)+;\s)+\$\w+\s?=\s?\'\';\s?\$\w+\s?=\s?\(\$\w+\(\$\w+\(\$\w+\)\)\)\s?%\s?sizeof\(\$\w+\);\s?\$\w+\s?=\s?\$\w+\[\$\w+\];\s?(\$\w+)\s?=\s?(?:\5\[\d+\]\s?\.?\s?)+;(\s?\18\s?=\s?\$_POST\[\18\];\s?(\14\s?=\s?\15\(\$_COOKIE\[\14\]\);)\s?\$\w+\s?=\s?\5\[\d+\]\s?\.\s?\5\[\d+\];\s?(eval\(\$\w+\(\18\)\);)\s?if\(!\16\){\s?((?:\$\w+\s?=\s?(?:\5\[\d+\]\s?\.?\s?)+;\s)+)(\$\w+\(\$\w+\);\s?echo\(\$\w+\);)\s?})~msi',
@@ -10841,7 +11502,7 @@ class Deobfuscator
             'id'   => 'strrotPregReplaceEval',
         ],
         [
-            'full' => '~(\$\w+)\s*=\s*[^\']+\'([^\']+)\';\s*(\$\w+)\s*=\s*\'([^\']+)\';\s*if\(!file_exists\(\$file\)+\{\s*@file_put_contents\(\1,base64_decode\(base64_decode\(\3\)+;\s*\}\s*\@include\s*\$file;~msi',
+            'full' => '~(\$\w+)\s*=\s*(?:\$\w+\.)?(?|[^\']+\'([^\']+)\'|[^"]+"([^"]+)");\s*(?:if\s*\(\!file_exists\(\1\)+\{\s*)?\s*(\$\w+)\s*=\s*(?|\'([^\']+)\'|"([^"]+)");\s*(?|@chmod\(\1,\s*\d+\);\s*|if\s*\(\!file_exists\(\1\)+\{\s*)@file_put_contents\(\1,\s*(?:base64_decode\()+\3\)+;\s*(?:@?chmod\(\1,\s*\d+\);)?\s*}\s*(?:(\$\w+)\s*=\s*\$\w+\."[^"]+";\s*(\$\w+)\s*=\s*@?file_get_contents\(\$\w+\);\s*\$\w+\s*=\s*base64_decode\("[^"]+"\);\s*\$\w+\s*=\s*preg_match\("[^"]+",\6\)\?true:false;\s*if\s*\(!\$\w+\){\s*\$\w+\s*=\s*"[^"]+";\s*preg_match_all\("/"\.base64_decode\(\$\w+\)\."/i",\$\w+,\$\w+\);\s*(\$\w+)\s*=\s*"[^"]+"\s*\.\s*substr\(chunk_split\(bin2hex\(\$\w+\),\s*2,\s*"\\\\x"\),\s*0,\s*-2\);\s*(\$\w+)\s*=\s*str_replace\(\$\w+\[\d\]\[\d\],\$\w+\[\d\]\[\d\]\.PHP_EOL.PHP_EOL.")?\s*@?include\s*(?|\\\\"\7\\\\";",\$\w+\);\s*@?file_put_contents\(\5,\8\);\s*\}|\1;)~msi',
             'id'   => 'dropInclude',
         ],
         [
@@ -10861,19 +11522,19 @@ class Deobfuscator
             'id'   => 'urlDecodeTable',
         ],
         [
-            'full' => '~((?:\$\w+=\'\w\';)+)((?:\$\w+=(\$\w+\.?)+;)+)eval\((\$\w+\()+\'([^\']+)\'\)+;~msi',
+            'full' => '~((?:\$\w+=[\'"][^\'"]+[\'"];\s?)+)((?:\$\w+=(?:\$\w+\.?)+;)+)\s{0,50}(eval\((?:\$\w+\()+\'[^\']+\'\)+;)~msi',
             'id'   => 'evalVarChar',
         ],
         [
-            'full' => '~(\$\w+\s*=\s*(base64_decode\s*\(|gzinflate\s*\(|strrev\s*\(|str_rot13\s*\(|gzuncompress\s*\(|urldecode\s*\(|rawurldecode\s*\(|htmlspecialchars_decode\s*\()+"([^"]+)"\);)\s*eval\("?(\$\w+)"?\);~msi',
+            'full' => '~(\$\w+\s*=\s*(base64_decode\s*\(|gzinflate\s*\(|strrev\s*\(|str_rot13\s*\(|gzuncompress\s*\(|urldecode\s*\(|rawurldecode\s*\(|htmlspecialchars_decode\s*\(|pack\(\'H\*\',\s*)+(?|"([^"]+)"|\'([^\']+)\')\);)\s*eval\("?(\$\w+)"?\);~msi',
             'id'   => 'evalVarFunc',
         ],
         [
-            'full' => '~((?:\$\w+\s*=\s*("[\w=+/\\\\]+");\s*)+)(eval\((\$\w+\(+)+(\$\w+)\)+);~msi',
+            'full' => '~((?:\$\w+\s*=\s*("[\w=+/\\\\ ".]+");\s*)+)(\$\w+\s*=\s*((?:\$\w+\()+\$\w+\)+);\s*)?((?:eval\((?(3)\$\w+|(?:\$\w+\(+)+\$\w+)\)+;\s*)+)~msi',
             'id'   => 'evalVarsFuncs',
         ],
         [
-            'full' => '~<\?php\s*(?:/\*[^=\$\{\}/]{10,499}[^\*\$\(;\}\{=]{1,99}\*/\s*)?(\$[^\w=(,${)}]{0,50})=\'(\w{0,50})\';((?:\$[^\w=(,${)}]{0,50}=(?:\1{\d+}\.?){0,50};){1,20})(\$[^=]{0,50}=\$[^\w=(,${)}]{1,50}\(\$[^\w=(,${)}]{1,50}\(\'\\\\{2}\',\'/\',__FILE__\)\);(?:\$[^\w=(,${)}]{0,50}=\$[^\w=(,${)}]{0,50}\(\$[^\w=(,${)}]{0,50}\);){2}\$[^\w=(,${)}]{0,50}=\$[^\w=(,${)}]{0,50}\(\'\',\$[^\w=(,${)}]{0,50}\)\.\$[^\(]{0,50}\(\$[^\w=(,${)}]{0,50},\d+,\$[^\w=(,${)}]{0,50}\(\$[^\w=(,${)}]{0,50},\'@ev\'\)\);\$[^\w=(,${)}]{0,50}=\$[^\(]{0,50}\(\$[^\w=(,${)}]{0,50}\);\$[^\w=(,${)}]{0,50}=\$[^\w=(,${)}=]{0,50}=\$[^\w=(,${)}]{0,50}=NULL;@eval\(\$[^\w=(,${)}]{0,50}\(\$[^\w=(,${)}(]{0,50}\(\$[^\w=(,${)}]{0,50},\'\',\$[^\w=(,${)}]{0,50}\(\'([^\']{0,500})\',\'([^\']{0,500})\',\'([^\']{0,500})\'\){4};)unset\((?:\$[^,]{0,50},?){0,20};return;\?>.+~msi',
+            'full' => '~(?:/\*[^=\$\{\}/]{10,499}[^\*\$\(;\}\{=]{1,99}\*/\s*)?(\$[^\w=(,${)}]{0,50})=\'(\w{0,50})\';((?:\$[^\w=(,${)}]{0,50}=(?:\1{\d+}\.?){0,50};){1,20})(\$[^=]{0,50}=\$[^\w=(,${)}]{1,50}\(\$[^\w=(,${)}]{1,50}\(\'\\\\{2}\',\'/\',__FILE__\)\);(?:\$[^\w=(,${)}]{0,50}=\$[^\w=(,${)}]{0,50}\(\$[^\w=(,${)}]{0,50}\);){2}\$[^\w=(,${)}]{0,50}=\$[^\w=(,${)}]{0,50}\(\'\',\$[^\w=(,${)}]{0,50}\)\.\$[^\(]{0,50}\(\$[^\w=(,${)}]{0,50},\d+,\$[^\w=(,${)}]{0,50}\(\$[^\w=(,${)}]{0,50},\'@ev\'\)\);\$[^\w=(,${)}]{0,50}=\$[^\(]{0,50}\(\$[^\w=(,${)}]{0,50}\);\$[^\w=(,${)}]{0,50}=\$[^\w=(,${)}=]{0,50}=\$[^\w=(,${)}]{0,50}=NULL;@eval\(\$[^\w=(,${)}]{0,50}\(\$[^\w=(,${)}(]{0,50}\(\$[^\w=(,${)}]{0,50},\'\',\$[^\w=(,${)}]{0,50}\(\'([^\']{0,500})\',\'([^\']{0,500})\',\'([^\']{0,500})\'\){4};)unset\((?:\$[^,]{0,50},?){0,20};return;\?>.+~msi',
             'id'   => 'evalFileContent',
         ],
         [
@@ -10972,7 +11633,7 @@ class Deobfuscator
             'id' => 'evalPackFuncs',
         ],
         [
-            'full' => '~parse_str\s*\(((?:\s?\'[^\,]+\'\s?\.?\s?){1,500}),\s?(\$\w{1,50})\s?\)\s?;\s?@?((?:eval\s?\()?\s?\2\s?\[\s?\d{1,5}\s?\]\s?\(\s?\2\s?\[\s?\d{1,5}\s?\]\s?(?:,\s?array\s?\(\s?\)\s?,\s?array\s?\(\s?\'([^\']{1,10})\'\s?\.(\$\w{1,50}\s?\[\s?\d\s?\]\s?\(\s?\$\w{1,50}\s?\[\s?\d\s?\]\s?\(\s?\$\w{1,50}\s?\[\s?\d{1,2}\s?\]\s?\()|\(\2\[\s?\d{1,5}\s?\]\s?\())\s?(\'[^\']+\'\s?)(\)\s*)?\)\s*\)\s*\.\s?\'([^\']{1,10})\'\s?\)\s?\)\s?;~msi',
+            'full' => '~parse_str\s*\(((?:\s?[\'"][^\,]+[\'"]\s?\.?\s?){1,500}),\s?(\$\w{1,50})\s?\)\s?;\s?@?((?:eval\s?\()?\s?\2\s?\[\s?\d{1,5}\s?\]\s?\(\s?\2\s?\[\s?\d{1,5}\s?\]\s?(?:,\s?array\s?\(\s?\)\s?,\s?array\s?\(\s?[\'"]([^\']{1,10})[\'"]\s?\.(\s?\$\w{1,50}\s?\[\s?\d+\s?\]\s?\(\s?\$\w{1,50}\s?\[\s?\d\s?\]\s?\(\s?\$\w{1,50}\s?\[\s?\d{1,2}\s?\]\s?\(\s?)|\(\s?\2\s?\[\s?\d{1,5}\s?\]\s?\())\s?([\'"][^\']+[\'"]\s?)(\)\s*)?\)\s*\)\s*\.\s?[\'"]([^\'"]{1,10})[\'"]\s?\)\s?\)\s?;~msi',
             'id' => 'parseStrFunc',
         ],
         [
@@ -11013,7 +11674,7 @@ class Deobfuscator
             'id' => 'includeB64',
         ],
         [
-            'full' => '~(\$\w+)=strrev\(\'nib2xeh\'\);(\$\w+)=array\(((?:\'[^\']+\',?)+)\);(\$\w+)\s*=\s*\'\';for\s*\(\$\w+\s*=\s*0;\s*\$\w+\s*<\s*\d+;\s*\$\w+\+\+\)\s*\{\4\s*\.=\s*str_replace\(array\(((?:\'([^\']*)\',?)+)\),\s*array\(((?:\'[^\']*\',?)+)\),\s*\2\[\$\w+\]\);\}eval\(\1\(\4\)\);~msi',
+            'full' => '~(\$\w+)=strrev\(\'nib2xeh\'\);(\$\w+)=array\(((?:\'[^\']+\',?)+)\);(\$\w+)\s*=\s*\'\';for\s*\(\$\w+\s*=\s*0;\s*\$\w+\s*<\s*\d+;\s*\$\w+\+\+\)\s*\{\4\s*\.=\s*str_replace\(array\(((?:\'([^\']*)\',?)+)\),\s*array\(((?:\'[^\']*\',?)+)\),\s*\2\[\$\w+\]\);\}(?:(?:\$\w+=)+(?:true;|hex2bin))?(?:eval\(\1\(\4\)\);)*~msi',
             'id' => 'nib2xeh',
         ],
         [
@@ -11021,7 +11682,7 @@ class Deobfuscator
             'id' => 'fun256',
         ],
         [
-            'full' => '~(\$\w+)\s*=\s*((?:\w+\()+)\'([^\']+)\'\)+;\s*if\s*\(\s*\'\w{40,40}\'\s*==\s*sha1\(\s*\1\s*\)\s*\)\s*{\s*\1\s*=\s*gzinflate\s*\(\s*gzinflate\s*\(\s*base64_decode\(\s*\1\s*\)\s*\)\s*\)\s*;\s*\$\w{1,10}\s*=\s*""\s*;for\s*\([^)]+\)\s*{[^}]+}\s*(?:\s*\$[^;]+;\s*)+for\s*\([^)]+\)\s*{\s*\$[^;]+;\s*if\s*\([^)]+\)\s*{[^}]+}(?:\s*\$[^;]+;\s*)+}\s*eval\s*\(\s*\$\w+\s*\)\s*;\s*}\s*else\s*{[^}]+}~msi',
+            'full' => '~(\$\w+)\s*=\s*((?:\$?\w+\()+)\'([^\']+)\'\)+;\s*if\s*\(\s*\'\w{40,40}\'\s*==\s*sha1\(\s*\1\s*\)\s*\)\s*{\s*\1\s*=\s*gzinflate\s*\(\s*gzinflate\s*\((?:\s*base64_decode|\$\w+)\(\s*\1\s*\)\s*\)\s*\)\s*;\s*\$\w{1,10}\s*=\s*""\s*;for\s*\([^)]+\)\s*{[^}]+}\s*(?:\s*\$[^;]+;\s*)+for\s*\([^)]+\)\s*{\s*\$[^;]+;\s*if\s*\([^)]+\)\s*{[^}]+}(?:\s*\$[^;]+;\s*)+}\s*eval\s*\(\s*\$\w+\s*\)\s*;[^}]*}\s*else\s*{[^}]+}~msi',
             'id' => 'fun256',
         ],
         [
@@ -11140,11 +11801,11 @@ class Deobfuscator
             'id' => 'funcDictVars',
         ],
         [
-            'full' => '~((\$\w{1,10})\s*=\s*\(\s*[\'"]([^\'"]{40,50000})[\'"]\s*\)\s*;\s*(\$\w{1,10})\s*=\s*base64_decode\s*\(\s*\2\s*\)\s*;)\s*(\$\w{1,10}\s*=\s*fopen\s*[^;]+;\s*echo\s*fwrite[^;]+;\s*fclose[^;]+;)~mis',
+            'full' => '~((\$\w{1,10})\s*=\s*\(\s*[\'"]([^\'"]{40,50000})[\'"]\s*\)\s*;\s*(\$\w{1,10})\s*=\s*base64_decode\s*\(\s*\2\s*\)\s*;)\s*(\$\w{1,10}\s*=\s*fopen\s*[^;]+;\s*echo\s*fwrite[^;]+;\s*fclose[^;]+;)~msi',
             'id' => 'funcFile2',
         ],
         [
-            'full' => '~function\s*(\w+)\((\$\w+)\)\s*\{\s*\2=((?:\w+\()+)\2(\)+);\s*for\(\$\w=0;\$\w+<strlen\(\2\);\$\w+\+\+\)\s*\{\s*\2\[\$\w+\]\s*=\s*chr\(ord\(\2\[\$\w+\]\)-(\d+)\);\s*\}\s*return\s*\2;\s*\}eval\(\1\(("[^"]+")\)\);~mis',
+            'full' => '~function\s*(\w+)\((\$\w+)\)\s*\{\s*\2=((?:\w+\()+)\2(\)+);\s*for\(\$\w=0;\$\w+<strlen\(\2\);\$\w+\+\+\)\s*\{\s*\2\[\$\w+\]\s*=\s*chr\(ord\(\2\[\$\w+\]\)-(\d+)\);\s*\}\s*return\s*\2;\s*\}eval\(\1\(("[^"]+")\)\);~msi',
             'id' => 'sec7or',
         ],
         [
@@ -11220,7 +11881,7 @@ class Deobfuscator
             'id' => 'strReplaceCreateFunc',
         ],
         [
-            'full' => '~function\s*(\w+)\((\$\w+)\)\s*\{\s*\$\w+\s*=\s*strlen\(trim\(\2\)+;\s*\$\w+\s*=\s*\'\';\s*(\$\w+)\s*=\s*0;\s*while\s*\(\(\(\$\w+\s*<\s*\$\w+\)+\s*\{\s*(\$\w+)\s*\.=\s*pack\([\'"]C[\'"],\s*hexdec\(substr\(\2,\s*\3,\s*2\)\)\);\s*\3\s*\+=\s*2;\s*\}\s*return\s*\4;\s*\}\s*eval\(\1\([\'"]([0-9a-f]+)[\'"]\)\s*\.\s*\'([^\']+\'\)+;)\s*\'\);~msi',
+            'full' => '~function\s*(\w+)\((\$\w+)\)\s*\{\s*\$\w+\s*=\s*strlen\(trim\(\2\)+;\s*\$\w+\s*=\s*\'\';(?:\s*for\s*\()?\s*(\$\w+)\s*=\s*0;\s*(?:while\s*\(\(\()?(?:if\s*\()?\$\w+\s*<\s*\$\w+(?:\)+)?(?:;\s*\3\s*\+=\s*[0x]*2\))?\s*\{\s*(\$\w+)\s*\.=\s*pack\([\'"]C[\'"],\s*hexdec\(substr\(\2,\s*\3,\s*[0x]*2\)\)\);(?:\s*\3\s*\+=\s*2;)?\s*\}\s*(?:else\s*\{\s*\}\s*)?return\s*\4;\s*\}\s*eval\(\1\([\'"]([0-9a-f]+)[\'"]\)\s*\.\s*(?|\'([^\']+\'\)+;)|\"([^\"]+\"\)+;))(?:\s*\'\);)?~msi',
             'id' => 'evalbin2hex',
         ],
         [
@@ -11304,7 +11965,7 @@ class Deobfuscator
             'id' => 'JoomlaInject',
         ],
         [
-            'full' => '~((\$\w{1,50})\s*=\s*[\'"]([^"\']+)[\'"];\s*)\$\w{1,50}\s*=\s*fopen\([^)]+\);\s*\$\w{1,50}\s*=\s*fwrite\s?\(\$\w{1,50}\s*,\s*(base64_decode\(\2\))\);~msi',
+            'full' => '~((\$\w{1,50})\s*=\s*[\'"]([^"\']+)[\'"];\s*)(?:\$\w{1,50}\s*=\s*fopen\([^)]+\);\s*\$\w{1,50}\s*=\s*fwrite\s?\(\$\w{1,50}\s*|fwrite\(fopen\([^)]+\)),\s*(base64_decode\(\2\))\);~msi',
             'id' => 'fwriteB64Content',
         ],
         [
@@ -11336,11 +11997,11 @@ class Deobfuscator
             'id' => 'B64Gz',
         ],
         [
-            'full' => '~function\s*(\w+)\((\$\w+)\)\s*\{\s*(?:\2=gzinflate\(base64_decode\(\2\)\);|\$\w+\s*=\s*base64_decode\(\2\);\s*\2\s*=\s*gzinflate\(\$\w+\);)\s*for\(\$\w+=0;\$\w+<strlen\s*\(\2\);\$\w+\+\+\)\s*\{\s*\2\[\$\w+\]\s*=\s*chr\(ord\(\2\[\$\w+\]\)(-?\d+)\);\s*\}\s*return\s*\2;\s*\}eval\(\1\s*\("([^"]+)"\)\);~msi',
+            'full' => '~function\s*(\w+)\((\$\w+)\)\s*\{\s*(?:\2=gzinflate\(base64_decode\(\2\)\);|\$\w+\s*=\s*base64_decode\(\2\);\s*\2\s*=\s*gzinflate\(\$\w+\);|(\$\w+)\s*=\s*\'\';)\s*for\s*\(\$\w+\s*=\s*0;\$\w+\s*<\s*strlen\s*\(\2\);\$\w+(?:\+\+|\s*\+=\s*1)\)\s*\{?\s*(?:\2|\3)(?:\[\$\w+\]|\s*\.)\s*=\s*chr\(ord\((?:\2|\3)\[\$\w+\]\)\s*(-?\s*\d+)\);\s*\}?\s*return\s*(?:\2|\3);\s*\}\s*(?:define\("[^"]+",\s*"\w{32}"\);)?(?:eval\(|(\$\w+)\s*=\s*)\1\s*((?:\(\w+)*)\((?|"([^"]+)"|\'([^\']+)\')\)+;(?:\s*call_user_func\(create_function\(\'\',\s*\5\)+;)?~msi',
             'id' => 'deltaOrd',
         ],
         [
-            'full' => '~(?(DEFINE)(?\'g\'(?:\$\{)?\$\{"(?:G|\\\\x47)(?:L|\\\\x4c)(?:O|\\\\x4f)(?:B|\\\\x42)(?:A|\\\\x41)(?:L|\\\\x4c)(?:S|\\\\x53)"\}\["[^"]+"\](?:\})?))(?:(?&g)="[^"]+";)+function\s*(\w+)\(\$\w+\)\s*\{(?&g)="[^"]+";(?&g)=gzinflate\(base64_decode\((?&g)\)\);\$\w+="[^"]+";for\((?&g)=0;(?&g)<strlen\((?&g)\);(?&g)\+\+\)\s*\{\$\w+="[^"]+";(?&g)="[^"]+";(?&g)\[\$\{\$\w+\}\]=chr\(ord\((?&g)\[(?&g)\]\)([\-\+]\d+)\);\}return\$\{\$\w+\};\}eval\(\2\("([^"]+)"\)\);~msi',
+            'full' => '~(?(DEFINE)(?\'g\'(?:\$\{)?\$\{"(?:G|\\\\x47)(?:L|\\\\x4c)(?:O|\\\\x4f)(?:B|\\\\x42)(?:A|\\\\x41)(?:L|\\\\x4c)(?:S|\\\\x53)"\}\["[^"]+"\](?:\})?))(?:(?&g)="[^"]+";)+function\s*(\w+)\(\$\w+\)\s*\{(?&g)="[^"]+";(?&g)=gzinflate\(base64_decode\((?&g)\)\);\$\w+="[^"]+";for\((?&g)=0;(?&g)<strlen\((?&g)\);(?&g)\+\+\)\s*\{\$\w+="[^"]+";(?&g)="[^"]+";(?&g)\[\$\{\$\w+\}\]=chr()\(ord\((?&g)\[(?&g)\]\)([\-\+]\d+)\);\}return\$\{\$\w+\};\}()()eval\(\2\("([^"]+)"\)\);~msi',
             'id' => 'deltaOrd',
         ],
         [
@@ -11473,6 +12134,198 @@ class Deobfuscator
             'full' => '~(?:\$\w{1,50}\s?=\s?[\'"][^\'"]+[\'"];\s?)+(\$\w{1,50})\s?=\s?(?:\d+[\+]*)+;.*?\$\w{1,50}\s?=\s?(\w+)\([\'"][^\'"]+[\'"],\s?\1,\s?[\'"][^\'"]+[\'"]\);.*?(\$\w{1,50})\s?=\s?(\$\w{1,50})\(\'\$\w{1,50}\',\s?(\$\w{1,50})\((\$\w{1,50})\((\$\w{1,50}),\s?[\'"](\d+)[\'"]\)\)\);(?:\$\w{1,50}\s?=\s?[\'"][^\'"]+[\'"];\s?)+\$\w{1,50}\(\$\w{1,50},\$\w{1,50}\([\'"]{2},\s?\3\(\$\w{1,50}\(\5\(\6\(\7,\s?[\'"](\d+)[\'"]\)\)\)\)\),\$\w{1,50}\);(?:\$\w{1,50}\s?=\s?[\'"][^\'"]+[\'"];)+\s?function\s\2\(.*return\s\$\w{1,50};}(?:\$\w{1,50}\s?=\s?[\'"][^\'"]+[\'"];\s?)+~msi',
             'id' => 'manyVarFuncCreateFuncWrap',
         ],
+        [
+            'full' => '~class\s*(_\w{1,20})\s*{\s*private\sstatic\s*\$_\w{1,10};\s*static\s*function\s*(\w{1,3})\s*\(\$_\w{1,20}\)\s*{\s*if\s*\([^)]{1,20}\)\s*:\s*self::\w{1,2}\(\);\s*endif;\s*return\s*self::\$_\w{1,10}\[\$_\w{1,10}\];\s*}\s*private\s*static\s*function\s*\w{1,2}\(\)\s*{\s*self::\$_\w{1,10}=array\(([^\)]{1,500})\);\s*}\s*}\s*\$GLOBALS\[["\']([^\]]{32,120})["\']\]=array\(([^)]{1,500})\);((?:\s*\$GLOBALS\["[_\w\d\\\]{1,120}"\]=base64_decode\([^)]{1,140}\)\s*;\s*)+)\s*class\s*(_\w{1,10})\s*{\s*private\s*static\s*\$_\w{1,10};\s*static\s*function\s*(\w{1,10})\([^)]{1,30}\)\s*{[^}]{1,900}\s*}private\s*static\s*function\s*\w{1,10}\(\)\s*{\s*self::\$_\w{1,10}=array\(([^)]{1,2300})\);\s*}\s*}\s*(.*;\s*;)~msi',
+            'id' => 'twoCalcClasses',
+        ],
+        [
+            'full' => '~(\$\w+)\s*=\s*array\(((?:[\'"][\w\$\)\;\(][\'"],?)+)\);\s*(\$\w+)\s*=\s*create_function\(\'([\$\w\'\.]+)\',((?:\1\[\d+\]\.?)+)\);\s*\3\(\'([^\']+)\'\);~msi',
+            'id' => 'createFuncArray',
+        ],
+        [
+            'full' => '~(\$\w+)\s*=\s*"([^"]+)";\s*function\s*(\w+)\(\)\s*\{\s*return\s*str_ireplace\("([^"]+)",\s*"([^"]+)",\s*"([^"]+)"\);\s*\}\s*(\$\w+)=strtr\("([^"]+)",\s*"([^"]+)",\s*"([^"]+)"\);\s*(\$\w+)\s*=\s*\3\(\);\s*(\$\w+)\s*=\s*\11\(\'\',\s*\7\(\1\)\);\s*\12\(\);~msi',
+            'id' => 'createFuncReplaceB64',
+        ],
+        [
+            'full' => '~((?:\$\w+\s*=\s*([lr]?trim)\(\'[^\']+\',\'[^\']+\'\);\s*)+)(\$\w+)\s*=\s*((?:\$\w+\s*\.?\s*)+);\s*(\$\w+)\s*=\s*\3\(\'([^\']+)\'\);\s*eval\((\$\w+=\&?)?\5\);~msi',
+            'id' => 'evalTrim',
+        ],
+        [
+            'full' => '~function\s*(\w+)\(\)\s{\s*(\$\w+\s*=\s*\'[^\']{32}\';\s*)(\$\w+)\s*=\s*\'([^\']+)\';\s*(((\$\w+)\s*=\s*(?:\3\[\d+\]\.?)+;\s*)+)\$\w+\(\7,\3\[\d+\]\."([^,]+)",\'\'\);\}\s*@?\1\(\);~msi',
+            'id' => 'funcDictB64',
+        ],
+        [
+            'full' => '~(\$\w{1,50})\s?=\s?[base64dco_"\'.]+;\s?(\$\w{1,50})\s?=\s?["\'gzinflate.]+;\s?(\$GLOBALS\[\'[^\']+\'\]\s?=\s?\$\w{1,50}\s?=\s?)unserialize\(\2\(\1\(join\(\'(\w+)\',array\(((?:\'[^\']*\',?\s?)+)\)+;~msi',
+            'id' => 'unserializeB64GzJoinArr',
+        ],
+        [
+            'full' => '~(\$\w{1,50})=\(?[\'"]([^\'"]+)[\'"]\);\s?((?:\$\w{1,50}=[\'"][^\'"]+[\'"];\s?)*(?:\$\w{1,50}=(?:\1{\d{1,5}}\.?)+;)+)\$\{"[^"]+"}\["[^"]+"\]\(\d\);{1,2}(?:.*?echo\s?.*?unset.*?exit\(\);)+[^;]+;\${"[^"]+"}\["[^"]+"]\(\);~msi',
+            'id' => 'dictVarsContent',
+        ],
+        [
+            'full' => '~(\${[\'"]GLOBALS[\'"]}\[[\'"](\w{1,50})[\'"]\])=[\'"](\w{1,50})[\'"];if\(isset\(\$_GET\[[\'"]\w{1,50}[\'"]\]\)&&\$_GET\[[\'"]\w{1,50}[\'"]\]==[\'"]\w{1,50}[\'"]\){((\${[\'"]GLOBALS[\'"]}\[[\'"]\w{1,50}[\'"]\])=[\'"]\w{1,50}[\'"];(\${[\'"]GLOBALS[\'"]}\[[\'"]\w{1,50}[\'"]\])=[\'"]\w{1,50}[\'"];(?:\$\w{1,50}=[\'"]\w{1,50}[\'"];)\${\1}=[\'".creat_funio]+;\${\5}=\$\3\(\'(\$\w{1,50})\',[\'".eval]+\(\\\\?\'\?>\\\\?\'\.[\'".base64_dco]+\(\7\)\);\'\);\${\6}\([\'"]([^\'"]+)[\'"]\);)exit;}~msi',
+            'id' => 'globalsCreateFuncEvalB64',
+        ],
+        [
+            'full' => '~(\$\w{1,50})\s?=\s?["\']([^"\']+)[\'"];\s?\$\w{1,50}\s?=\s?[\'"]{2};\s?foreach\s?\(\[[^]]+\]\s?as\s?\$\w{1,50}\)\s?{\s?\$\w{1,50}\s?\.=\s?\$\w{1,50}\[\$\w{1,50}\];\s?}\s?if\s?\(isset\(\$_REQUEST\["{\$\w{1,50}}"\]\)\)\s?{\s?\$\w{1,50}\s?=\s?\$_REQUEST\["{\$\w{1,50}}"\];\s?(?:\$\w{1,50}\s?=\s?["\']{2};\s?)+(?:foreach\s?\(\[[^]]+\]\s?as\s?\$\w{1,50}\)\s?{\s?\$\w{1,50}\s?\.=\s?\$\w{1,50}\[\$\w{1,50}\];\s?}\s?)+\$\w{1,50}\s?=\s?\$\w{1,50}\((?:[^)]+)\);\s?\$\w{1,50}\s?=\s?\$\w{1,50}\([\'"]{2},\s?\$\w{1,50}\(\$\w{1,50}\)\);\s?\$\w{1,50}\(\);\s?exit;\s?}~msi',
+            'id' => 'dictForeachVars',
+        ],
+        [
+            'full' => '~(\$\w{1,50})\s?=\s?[\'".\sgzinflate\dxa-fhr\(\)\\\\]+;\s?(\$\w{1,50})\s?=[\'".\sbase64_dcod\dxa-fhr\(\)\\\\]+;\s?(\$\w{1,50})\s?=\s?\1\(\2\((?:str_replace\("[^"]+",\s?"",\s?)?[\'"]([^\'"]+)[\'"]\)\)\)?;\s?echo\s?(?:"{\${)?\s?eval\(\3\)\s?(?:}}")?;~msi',
+            'id' => 'echoEvalGzB64Var',
+        ],
+        [
+            'full' => '~eval\(((?:str_rot13|strrev))\(\s*\'((?:.*?\\\\\')+[^\']+)\'\s?\)\);~msi',
+            'id' => 'evalFuncCode',
+        ],
+        [
+            'full' => '~eval\(openssl_decrypt\(\s?base64_decode\([\'"]([^\'"]+)[\'"]\),\s?[\'"]([^\'"]+)[\'"],\s?base64_decode\([\'"]([^\'"]+)[\'"]\),\s?OPENSSL_RAW_DATA,\s?base64_decode\([\'"]([^\'"]+)[\'"][^;]+;~msi',
+            'id' => 'evalOpenSslDecrypt',
+        ],
+        [
+            'full' => '~(\$\w{1,50})\s?=\s?urldecode\(\'([^\']+)\'\);function\s\w{1,50}(?:.*?(?:\1{\d+}\.?)+)+;~msi',
+            'id' => 'urldecodedDictVarReplace',
+        ],
+        [
+            'full' => '~global\s*\$(\w+);((?:\$\1\[\'[^\']+\'\]=base64_decode\(\'[^\']+\'\);)+)[\s\?\>\<ph]{0,10}((?:.+?\$GLOBALS\[\'\1\'\]\[\'[^\']+\'\][^;]+;)+}?(?:(?:if\s*\([^}]+})+return\s*[^}]+\}+|(?:.{1,250}?base64_decode\(\'[^\']+\'\))+[^}]+\}+)?)~msi',
+            'id' => 'zymdecrypt',
+        ],
+        [
+            'full' => '~function\s*(\w+)\((\$\w+)\)\s*\{\s*(?:(\$\w+)=strrev\(\2\);\s*\2=base64_decode\(\3\);\s*)+return\s*\((?:"\?\>"\s*\.\s*)?\2\);\s*\}\s*(eval\(\1\("[^"]+"\)\);)~msi',
+            'id' => 'funcRevB64',
+        ],
+        [
+            'full' => '~error_reporting\(\d\);\s?(\$\w{1,50})=create_function\(null,gzinflate\(convert_uudecode\("([^"]+)"\)\)\);\1\(\);~msi',
+            'id' => 'createFuncGzConvertUudecode',
+        ],
+        [
+            'full' => '~\$GLOBALS\["[^"]+"\]=Array\(\);\s?\?><\?php\sif\s?\(\!function_exists\("(\w{1,50})"\)\)\s?{function\s?\1\(\$\w{1,50}\){\$\w{1,50}=Array\(((?:[\'"][^"\']+[\'"]\s?\.?)+)\);return\sbase64_decode\(\$\w{1,50}\[\$\w{1,50}\]\);}}\s?\?><\?php\s?if\(isset\(\$GLOBALS\[\1\(0\)\]\)\)return;\s?\?><\?php\sfunction\s(\w{1,50})\(\$\w{1,50}\)\s?{\$\w{1,50}=Array\(((?:(?:[\'"][^"\']*[\'"]\s?\.?)+,?)+)\);return\sbase64_decode\(\$\w{1,50}\[\$\w{1,50}\]\);}\s?(?:.*?\3\(\d{1,5}\))+.*?\?>~msi',
+            'id' => 'globalsArrayFuncs',
+        ],
+        [
+            'full' => '~ini_set\([\'"][^\'"]+[\'"],\s?[\'"][^\'"]+[\'"]\);(\$\w{1,50})\s?=\s?array\(((?:[\'"][^\'"]+[\'"]\s?=>(?:\s?(\w{1,50})\(\d{1,5}\)\.?|\s?\$\w{1,50})+,?)+)\);.*?function\s\3\(\$\w{1,50}\){return\schr\(\$\w{1,50}\);}(?:.*?\1\[[\'"][^\'"]+[\'"]\])+.*?return\s\$\w{1,50};}\s?\w{1,50}\(\);~msi',
+            'id' => 'varArrayChrFunc',
+        ],
+        [
+            'full' => '~error_reporting\(\d{1,5}\);\s?function\s(\w{1,50})\(\$\w{1,50}\)\s?{\s?\$\w{1,50}\s?=\s?base64_decode\(\$\w{1,50}\);\s?\$\w{1,50}\s?=\s?openssl_decrypt\("\$\w{1,50}",\s?[\'"]AES-256-CBC[\'"],\s?[\'"]([^\'"]+)[\'"],\s?0,\s?[\'"]([^\'"]+)[\'"]\);return\s\$\w{1,50};\s?}(\$\w{1,50})\s?=\s?([\'"][^\'"]+[\'"]);.*?(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];\s?eval\(\1\(\6\)\);~msi',
+            'id' => 'evalOpensslDecryptStr',
+        ],
+        [
+            'full' => '~error_reporting\(\d{1,5}\);\s?function\s(\w{1,50})\(\)\s?{\s?(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];\s?\$\w{1,50}\s?=\s?((?:(?:\2\[\d{1,5}\]|[\'"][(_\\\\\'"]+[\'"])\s?\.?\s?)+);\sreturn\s\$\w{1,50};\s?}\s?eval\(\1\(\)\s?\.\s?([\'"][^\'"]+[\'"]\)+;)[\'"]\);~msi',
+            'id' => 'evalDictionaryFuncVar',
+        ],
+        [
+            'full' => '~(?:\$\w+=base64_decode\((?:(?:chr\(\d+\)|"[\w=]"|\'[\w=]\')\.?)+\);)+(?:(?:update_option\(|\$\w+=)\$\w+\([^;]+;)+~msi',
+            'id' => 'manyBase64DecodeChr',
+        ],
+        [
+            'full' => '~define\((?:base64_decode\()+[\'"][^\'"]+[\'"]\)+,\s?__FILE__\);\s?\${(?:base64_decode\()+[\'"][^\'"]+[\'"]\)+}\s?=\s?(?:base64_decode\([\'"][^\'"]+[\'"]\));\s?(?:\${(?:base64_decode\()+[\'"][^\'"]+[\'"]\)+}\s?\.?=\s?(?:\${(?:base64_decode\()+[\'"][^\'"]+[\'"]\)+}\[[\d\-\+\s(\)]+\]\s?\.?\s?)+;\s?)+eval\(\${(?:base64_decode\()+[\'"][^\'"]+[\'"]\)+}\([\'"][^\'"]+[\'"]\)+;~msi',
+            'id' => 'manyB64CalcEval',
+        ],
+        [
+            'full' => '~(\$[^ =]+)\s*=\s*\'([^\']+)\';\s*([^(]+)\(\1\);\s*function\s*\3\((\$[^\)]+)\)\{\s*(\$[^= ]+)\s*=\s*\'[base64_dco.\']+;\s*(\$[^= ]+)\s*=\s*array\(((?:(?:\'[\w+@\)#%\(\$\*;]\'|\5\(\'[^\']+\'\)),?)+)\);\s*((?:(\$[^= ]+)\s*=\s*(?:\6\[\d+\]\.?)+;\s*)+)(\$[^= ]+)\s*=\s*([^;]+);return\s*eval\(\10\);\s*\}~msi',
+            'id' => 'da7Q9RnPjm',
+        ],
+        [
+            'full' => '~(?:\$\w{1,50}\s?=\s?(?:[\'"][^\'"]+[\'"]|(?:str_replace|\$\w{1,50})\([\'"][^\'"]+[\'"],\s*[\'"][^\'"]*[\'"],\s*[\'"][^\'"]+[\'"]\));\s*)+(\$\w{1,50}\s?=\s?\$\w{1,50}\([\'"]{2},\s*((?:\$\w{1,50}\()+)[\'"]([^\'"]+)[\'"],\s?[\'"]{2},\s?((?:\$\w{1,50}\.?)+)\)+;)~msi',
+            'id' => 'strReplaceVarsCreateFunc',
+        ],
+        [
+            'full' => '~(?:\$\w+\s*=\s*\'[^\']+\';\s*)+\$\w+=(?:\$\w+(?:\[\'?\d+\'?\])?\s*\.?\s*)+;\s*(\$\w+)\s*=\s*\$\w+;\s*(\$\w+)\s*=\s*\$\w+\(\1,(?:\$\w+(?:\[\'?\d+\'?\])?\s*\.?\s*)+\);\s*\2\s*\((?:\$\w+(?:\[\'?\d+\'?\])?\s*\.?,?\s*)+\);~msi',
+            'id' => 'createFuncDict',
+        ],
+        [
+            'full' => '~(\$\w+)=\'create_function\';(\$\w+)=\'\s*\';(\$\w+)=\1\(\2,\'eval\(array_pop\(func_get_args\(\)+;\'\);\3\((?:(\'[^\']+\',?)+)\);~msi',
+            'id' => 'createFuncArrayPop',
+        ],
+        [
+            'full' => '~error_reporting\(\d\);\s*(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];\s*(?:\$\w{1,50}\s?=\s?base64_decode\([\'"][^\'"]+[\'"]\);\s?)+(?:\$\w{1,50}\s?=\s?\$\w{1,50}\(\1\);\s?)+(\$\w{1,50})\s?=\s?[\'"]{2};\s?for\(\$\w{1,50}\s?=\s?0\s?;\s?\$\w{1,50}\s?\<\s?\$\w{1,50}\s?;\s?\$\w{1,50}\+\+\s?\){\3\s?\.=\s?(\$\w{1,50})\({1,5}(\$\w{1,50})\(\$\w{1,50}\[\$\w{1,50}\]\)\s?\^\s?(\d{1,20})\)+\s?;\s?}\s?eval\s?\(\3\);\s?return;~msi',
+            'id' => 'chrOrdB64FuncVars',
+        ],
+        [
+            'full' => '~class\s(\w{1,50})\s{0,10}{\s{0,10}private\sstatic\s(\$\w{1,50});\s{0,10}static\sfunction\s(\w{1,50})\((\$\w{1,50}),\s?(\$\w{1,50})\)\s?{\s?if\s?\(!self::(\$\w{1,50})\):\s?self::(\w{1,50})\(\);\s?endif;\s?(\$\w{1,50})\s?=\s?strlen\(\5\);\s?(\$\w{1,50})\s?=\s?base64_decode\(self::\2\[\4\]\);\s?for\s?\((\$\w{1,50})\s?=\s?0\s?,\s?(\$\w{1,50})\s?=\s?strlen\(\9\);\s?\10\s?!==\s?\11;\s?\+\+\10\):\s?\9\[\10\]\s?=\s?chr\(ord\(\9\[\10\]\)\s?\^\s?ord\(\5\[\10\s?%\s?\8\]\)\);\s?endfor;\s?return\s\9;\s?\}\s?private\sstatic\sfunction\s\7\(\)\s?{\s?self::\6\s?=\s?array\(((?:[^=]+=>[^,]+)+)\);\s?}\s?}((?:.*?\1::\3\([^)]+\))+[;}\s]+)~msi',
+            'id' => 'classArrayDictFunc',
+        ],
+        [
+            'full' => '~(\$\w{1,50})\s?=\s?[\'"]{2};\s?(\$\w{1,50})\s?=\s?[\'"]{2};\s?((?:\2\s?\.=\s?"[^"]+";\s?)+)(\$\w{1,50})\s?=\s?"((?:[^";]+;?"?)+)"\s?;\s?(\$\w{1,50})\s?=\s?"((?:[^";]+;?"?)+)"\s?;\s?foreach\(str_split\(\2\)\s?as\s?(\$\w{1,50})\)\s?{\s?\1\s?\.=\s?\(strpos\(\6,\s?\8\)\s?===\s?false\)\s?\?\s?\8\s?:\s?\4\[strpos\(\6,\s?\8\)\];\s?}\s?\1\s?=\s?"\?>\1"\s?;\s?eval\(\s?\1\s?\);~msi',
+            'id' => 'concatVarsIterDict',
+        ],
+        [
+            'full' => '~function\s(\w{1,50})\((\$\w{1,50}),\s?(\$\w{1,50})\)\s?{\s?(\$\w{1,50})\s?=\s?[\'"]{2};\s?for\((\$\w{1,50})\s?=\s?0;\s?\5\s?<\s?strlen\(\s?\2\s?\)\s?;\s?\)\s?for\((\$\w{1,50})\s?=\s?0\s?;\s?\6\s?<\s?strlen\(\s?\3\s?\);\s?\6\+\+,\s?\5\+\+\s?\)\s?\4\s?\.=\s?\2{\5}\s?\^\s?\3{\6}\s?;\s?return\s\4;\s?}\s?;\s?(?:\$\w{1,50}\s?=\s?[\'"][^\'"]+[\'"];\s?)*eval\(\1\(base64_decode\([\'"]([^\'"]+)[\'"]\)\s?,\s?[\'"]([^\'"]+)[\'"]\)\);\s?(?:\$\w{1,50}\s?=\s?[\'"][^\'"]+[\'"];\s?)*~msi',
+            'id' => 'funcB64TwoArgs',
+        ],
+        [
+            'full' => '~(?:\$\w+=base64_decode\(\'[^\']+\'\);)+(?:(\$\w+)=str_replace\(base64_decode\(\'[^\']+\'\),\'\',(?:base64_decode\(\'[^\']+\'\)|(?:\$\w+\.?)+)\);)+(\$\w+)=\$\w+\(\'\',\1\);\2\(\);~msi',
+            'id' => 'strReplaceB64',
+        ],
+        [
+            'full' => '~(\$\w+)=str_replace\(\'([^\']+)\',\'\',\'([^\']+)\'\);(\$\w+)=create_function\(\'\',\1\);\4\(\);~msi',
+            'id' => 'createFuncStrReplace',
+        ],
+        [
+            'full' => '~(\$\w+)\s?=\s?base64_decode\(\'([^\']+)\'\);\s?(\$\w+)\s?=\s?\'[\w\.]+\';\s?(\$\w+)\s?=\s?\(file_exists\(\3\)\)\s?\?\s?fopen\(\3,\s?"a\+"\)\s?:\s?fopen\(\3,\s?"w\+"\);\s?fwrite\(\4,\s?\1\);\s?fclose\(\4\);~msi',
+            'id' => 'fwriteB64Shell',
+        ],
+        [
+            'full' => '~((\$\w{1,50})\s*=\s*"(\\\\[\w\\\\]+)?";\s*)+(?:error_reporting\(0\);\s*)?(\$\w{1,50})\s*=\s*\$\w+\(([\'"][^\'"]+[\'"])\);\s*\4\s*=\s*\2\(\4\);\s*\$\w+\s*=\s*\$\w+\(\'[^\']+\',\4\);~msi',
+            'id' => 'createFuncGzuncompressB64',
+        ],
+        [
+            'full' => '~(?:\$\{"[\\\\x0-9a-fGLOBALS]+"}\["[^"]+"\]="[^"]+";)+echo\s*"[^"]+";if\(isset\(\$_POST\["[^"]+"\]\)\)\{date_default_timezone_set\("[^"]+"\);(?:(?:(?:\$\{)+"[\\\\x0-9a-fGLOBALS]+"}\["[^"]+"\]\}?|\$\w+|\$\{\$\w+\})=[^;]+;)+move_uploaded_file\([^\)]+\);}if\(isset\(\$_GET\["[^"]+"\]\)\)\{echo\s*"[^;]+";exit\(0\);\}~msi',
+            'id' => 'globalsSlashed',
+        ],
+        [
+            'full' => '~(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];\s{0,10}((?:\$\w{1,50}\s?=\s?base64_decode\([\'"][^\'"]+[\'"]\);\s?)+)\s?\1\s?=\s?(\$\w{1,50})\((\$\w{1,50})\(\1\)\);\s?(\$\w{1,50})\s?=\s?(\$\w{1,50})\(\1\);\s?(\$\w{1,50})\s?=\s?[\'"]{2};\s?for\((\$\w{1,50})\s?=\s?0;\s?\9\s?<\s?\6;\s?\9\+\+\s?\)\s?{\8\s?\.=\s?(\$\w{1,50})\(\((\$\w{1,50})\(\1\[\9\]\)\s?\^\s?(\d{1,10})\)\);}\s?eval\(\8\);\s?return;~msi',
+            'id' => 'b64VarsFuncEval',
+        ],
+        [
+            'full' => '~(?:\@null;\s*echo\@null;\s*)?((?:\$\w+=\'\w+\';\s*)+)((?:\$\w+=(?:\$\w+\.?)+;\s*)+)(eval\((?:\$\w+\()+(?:\'[^\']+\'|"[^"]+")\)+;)(?:\s*\@null;)?(exit;)?~msi',
+            'id' => 'nullEcho',
+        ],
+        [
+            'full' => '~(\$\w{1,40})\s?=\s?\(\"(.+)\"\);.*\@header\(\$\w{1,40}\);.*exit\(\);~msi',
+            'id' => 'arrayReplacing',
+        ],
+        [
+            'full' => '~((?:(?:\$\w{1,50}\s?=\s?[\'"]\w+[\'"];)+\s*\$\w{1,50}\s?=\s?(?:\$\w{1,50}\.?)+;\s*)+)eval\((?:\$\w{1,50}\(?)+[\'"][^\'"]+[\'"]\)+;~msi',
+            'id' => 'varConcatedReplaceEval',
+        ],
+        [
+            'full' => '~(\$\w{1,50}+)\s?=\s?[\'"]{2};(?:(?:\$\w{1,50}\s?=\s?[\'"][^\'"]+[\'"];)+\$\w{1,50}\s?\.=\s?\$\w{1,50};\s?)+((?:(?:\$\w{1,50}\s?=\s?[\'"]\w+[\'"];\s?)+\s*\$\w{1,50}\s?=\s?(?:\$\w{1,50}\.?)+;\s*)+)\s?function\s(\w{1,50})\((\$\w{1,50}+),\s?(\$\w{1,50}+)\)\s?{\s?return\sstr_replace\(\5,\s?[\'"]([^\'"]+)[\'"],\s?\4\);\s?}\s*eval\(((?:\$\w{1,50}\()+)\3\(\1,\s?[\'"]([^\'"]+)[\'"]\)+;~msi',
+            'id' => 'varsConcatedFuncStrReplaceEval',
+        ],
+        [
+            'full' => '~error_reporting\(E_ALL\)\;\s?\$\w{1,50}\s?=\s?[\'"](.*)[\'"]\;\s?file_put_contents\(\$_SERVER\[[\'"]DOCUMENT_ROOT[\'"]\].+base64_decode.+~msi',
+            'id' => 'b64putContents',
+        ],
+        [
+            'full' => '~(?:\$\w+=base64_decode\(\'[^\']+\'\);)+\s*(?:\$\w+=\$_SERVER\[base64_decode\(\'[^\']+\'\)\];)+\$\w+="[^"]+";(?:\$\w+\.?=(?:base64_decode\(\'[^\']+\'\)\.?)+;)+mail\(base64_decode\(\'[^\']+\'\),\$\w+,\$\w+,\$\w+\);\s*eval(?:\(\$\w+)+\(+\$\w+\)+;~msi',
+            'id' => 'b64WSO',
+        ],
+        [
+            'full' => '~function\s*(\w+)\(\)\s*\{\s*(\$\w+)\s*=\s*\'([^\')]+)\';\s*(\$\w+)\s*=((?:\s*(?:\2\[\d+\]|\'[^\';]+\'+)\s*\.?)+);\s*return\s*\4;\s*\}\s*eval\(\1\(\)\s*\.\s*\'([^\']+)\'\)+;\s*\'\);~msi',
+            'id' => 'evalFuncDict',
+        ],
+        [
+            'full' => '~((\$\w+)=(?|urldecode\(\'([^\']+)\'\);|"([^"]+)";))((?:\$\w+\.?=(?:\$\w+[\[\{][0-9a-fx]+[\]\}]\.?)+;)+)(?|eval\(\$\w+\(\'([^\']+)\'\)\);|\$\w+=\$\w+\("",\$\w+\("([^"]+)")(?:\)\);\$\w+\(\);)?~msi',
+            'id' => 'urldecodeEval',
+        ],
+        [
+            'full' => '~((?:\$\w+=\'[^\']+\';)+)(\$\w+)="([^"]+)";\s*(eval\(\'\?>\'\.(?:\$\w+\()+\$\w+,\$\w+\*\d+\),\$\w+\(\$\w+,\$\w+,\$\w+\),\s*\$\w+\(\$\w+,\d+,\$\w+\)+);~msi',
+            'id' => 'strtrEval',
+        ],
+        [
+            'full' => '~(\$\w+)\s*=\s*"[^"]+";(?:\s*\$\w+\s*=\s*base64_decode\("[^"]+\s*"\);\s*)+\$\w+\s*=\s*fopen\([^\)]+\)\s*or\s*die\([^\)]+\);\s*\$\w+\s*=\s*\$\w+;\s*fwrite\(\$\w+,\s*\$\w+\);\s*fclose\(\$\w+\);\s*\$\w+\s*=\s*[^;]+;\s*\$\w+\s*=\s*fopen\(\$\w+,\s*"w"\)\s*or\s*die\([^\)]+\);\s*\$\w+\s*=\s*base64_decode\("[^"]+\s*"\);\s*fwrite\(\$\w+,\s*\$\w+\);\s*fclose\(\$\w+\);\s*\$\w+\s*=\s*"[^"]+";\s*.*?\1;\s*(\$\w+)\s*=\s*"[^"]+";\s*[^\)]+\);\s*\$\w+\s*=\s*"https://api\.telegram\.org/bot\2/sendmessage";\s*.*?curl_close\(\$\w+\);~msi',
+            'id' => 'autoExploit',
+        ],
+        [
+            'full' => '~(?:\$\w+=\'[^\']+\';)*(\$\w+)=create_function\("",base64_decode\("([^\']+)"\)\);\1\(\);~msi',
+            'id' => 'createFuncB64',
+        ],
+        [
+            'full' => '~(\$\w+)=(\d+);(\$\w+)=explode\("([^"]+)","([^"]+)"\);(\$\w+)="";foreach\(\3\s*as\s*(\$\w+)\)\s*if\s*\(\7!=""\)\s*\6\.=chr\(\7\^\1\);\s*eval\(\6\);~msi',
+            'id' => 'chrXor',
+        ],
         /*[
             'full' => '~class\s*(\w+)\s*{\s*function\s*__construct\(\)\s*\{\s*(\$\w+)\s*=\s*\$this->(\w+)\(\$this->\w+\);\s*\2\s*=\s*\$this->(\w+)\(\$this->(\w+)\(\2\)\);\s*\2\s*=\s*\$this->(\w+)\(\2\);\s*if\(\2\)\s*\{\s*\$this->(\w+)\s*=\s*\2\[\d\];\s*\$this->(\w+)\s*=\s*\2\[\d\];\s*\$this->\w+\s*=\s*\2\[\d\];\s*\$this->(\w+)\(\2\[\d\],\s*\2\[\d\]\);\s*\}\s*\}\s(?:function\s*\w+\((?:(?:\$\w+),?\s?){0,3}\)\s*\{\s*(?:\$this->\w+\s*=\s*\$\w+;\s*\$this->\w+\s*=\s*\$\w+;\s*\$this->\w+\s*=\s*\$this->\3\(\$this->\w+\);\s*\$this->\w+\s*=\s*\$this->\5\(\$this->\w+\);\s*\$this->\w+\s*=\s*\$this->\w+\(\);\s*if\(strpos[^{]+{[^}]+}\s*\}\s*|\$\w+\s*=\s*(?:\$this->\w+\[\d\]\.?)+;\s*(?:\$\w+\s*=\s*@?\$\w+\((?:\'\',\s*)?(?:(?:\$\w+),?\s?){0,3}\);)?\s*(?:return\s*\$\w+(?:\((?:"[^"]+",\s*"",\s*\$\w+)?\))?;)?\s*\}\s*|\$\w+\s*=\s*strlen\(\$\w+\)\s*\+\s*strlen\(\$\w+\);\s*while\(strlen\(\$\w+\)\s*<\s*\$\w+\)\s*\{\s*\$\w+\s*=\s*ord\(\$\w+\[\$this->\w+\]\)\s*-\s*ord\(\$\w+\[\$this->\w+\]\);\s*\$\w+\[\$this->\w+\]\s*=\s*chr\(\$\w+\s*%\s*\(2048/8\)\);\s*\$\w+\s*\.=\s*\$\w+\[\$this->\w+\];\s*\$this->\w+\+\+;\s*\}\s*return\s*\$\w+;\s*\}\s*|\$this->\w+\s*=\s*\$this->\w+\(\$this->\w+,\s*\$this->\w+,\s*\$this->\w+\);\s*\$this->\w+\s*=\s*\$this->\w+\(\$this->\w+\);\s*return\s*\$this->\w+;\s*\}\s*))+var\s*\$\w+;\s*var\s*\$\w+\s*=\s*0;\s*(?:var\s*\$\w+\s*=\s*array\([\'gzinflatecr_utobs64dtkp, ]+\);\s*)+var\s*\$\w+\s*=\s*\'([^\']+)\';\s*var\s*\$\w+\s*=\s*\'([^\']+)\';\s*\}\s*new\s*\1\(\);~msi',
             'id' => 'classDecoder',
@@ -11488,7 +12341,7 @@ class Deobfuscator
         /*************************************************************************************************************/
 
         [
-            'full' => '~((<script[^>]*>)\s*.{0,300}?)?(eval\()?String\.fromCharCode\(([\d,\s]+)\)(?(3)\);+|)(\s*.{0,300}?</script>)?~msi',
+            'full' => '~((<script[^>]*>)\s*.{0,400}?)?(eval\()?String\.fromCharCode\(([\d,\s]+)\)(?(3)\);+|)((?(2)\s*.{0,400}?</script>|))~msi',
             'fast' => '~String\.fromCharCode\([\d,\s]+\)~msi',
             'id'   => 'JS_fromCharCode',
         ],
@@ -11503,7 +12356,7 @@ class Deobfuscator
             'id'   => 'JS_ObfuscatorIO',
         ],
         [
-            'full' => '~<script\s(?:language|type)=[\'"](?:text/)?javascript[\'"]>\s*(?:(?:<!--.*?-->)?\s?<!--\s*)?document\.write\((?:unescape\()?[\'"]([^\'"]+)[\'"]\)\)?;(?:\s?//-->)?\s*</script>~msi',
+            'full' => '~<script\s(?:language|type)=[\'"]?(?:text/)?javascript[\'"]?>\s*(?:(?:<!--.*?-->)?\s?<!--\s*)?document\.write\((?:unescape\()?[\'"]([^\'"]+)[\'"]\)\)?;?(?:\s?//-->)?(?:(\w+)\(\'([^\']+)\'\))?\s*</script>~msi',
             'id'   => 'JS_documentWriteUnescapedStr',
         ],
         [
@@ -11513,6 +12366,14 @@ class Deobfuscator
         [
             'full' => '~\(function\s*\(\$,\s*document\)\s*({([^{}]*+(?:(?1)[^{}]*)*+)})\)\(\(function\s*\((\w),\s*(\w)\)\s*\{\s*function\s*(\w)\((\w+)\)\s*\{\s*return\s*Number\(\6\)\.toString\(36\)\.replace\(/\[0\-9\]/g,\s*function\s*\((\w)\)\s*\{\s*return\s*String\.fromCharCode\(parseInt\(\7,\s*10\)\s*\+\s*65\);\s*\}\s*\);\s*\}\s*var\s*\w+\s*=\s*\{\s*\$:\s*function\s*\(\)\s*\{\s*var\s*\w+\s*=\s*\{\};\s*[^}]+\}\s*return\s*\w;\s*\}\s*\};\s*\3\s*=\s*\3\.split\(\'\+\'\);\s*for\s*\(var\s*\w\s*=\s*0;\s*\w\s*<\s*(\d+);\s*\w\+\+\)\s*\{\s*\(function\s*\(\w\)\s*\{\s*Object\.defineProperty\(\w,\s*\5\(\w\),\s*\{\s*get:\s*function\s*\(\)\s*\{\s*return\s*\w\[\w\]\[0\]\s*\!==\s*\';\'\s*\?\s*\4\(\w\[\w\]\)\s*:\s*parseFloat\(\w\[\w\]\.slice\(1\),\s*10\);\s*\}\s*\}\);\s*\}\(\w\)\);\s*\}\s*return\s*\w;\s*\}\(\'([^\']+)\',\s*function\s*\(\w\)\s*\{\s*for\s*\(var\s*(\w)\s*=\s*\'([^\']+)\',\s*(\w)\s*=\s*\[([^\]]+)\],\s*\w\s*=\s*\'\'[^{]+\{\s*var\s*(\w)\s*=\s*\10\.indexOf\(\w\[\w\]\);\s*\12\.indexOf\(\w\[\w\]\)\s*>\s*\-1\s*&&\s*0\s*===\s*\12\.indexOf\(\w\[\w\]\)\s*&&\s*\(\w\s*=\s*0\),\s*\14\s*>\s*-1\s*&&\s*\(\w\s*\+=\s*String\.fromCharCode\(\w\s*\*\s*\10\.length\s*\+\s*\14\),\s*\w\s*=\s*1\);\s*\}\s*return\s*\w;\s*\}\)\),\s*\(function\s*\(\w\)\s*\{\s*var\s*_\s*=\s*{};\s*for\s*\(\w\s*in\s*\w\)\s*\{\s*try\s*\{\s*_\[\w\]\s*=\s*\w\[\w\]\.bind\(\w\);\s*\}\s*catch\s*\(\w\)\s*\{\s*_\[\w\]\s*=\s*\w\[\w\];\s*\}\s*\}\s*return\s*_;\s*\}\)\(document\)\)~msi',
             'id'   => 'JS_objectDecode',
+        ],
+        [
+            'full' => '~<script\s*src="data:text/javascript;base64,([^"]+)"></script>~msi',
+            'id'   => 'JS_B64Embedded',
+        ],
+        [
+            'full' => '~function\s?(_0x\w+)\(_0x\w+,\s?_0x\w+\)\{var\s?_0x\w+=(_0x\w+)\(\);return\s?\1=function\(_0x\w+,\s?_0x\w+\)\{_0x\w+=_0x\w+-(0x\w+);var\s?_0x\w+=_0x\w+\[_0x\w+\];return\s?_0x\w+;},\1\(_0x\w+,\s?_0x\w+\);\}\s*\(function\((_0x\w+),\s?_0x\w+\)\{var\s?(_0x\w+)=\1,_0x\w+=\4\(\);while\(!!\[\]\)\{try\{var\s?_0x\w+=((?:parseInt\(\5\(0x\w+\)\)/0x\w+\)?[\+\*]?\(?-?)+);if\(_0x\w+===_0x\w+\)break;else\s?_0x\w+\[\'push\'\]\(_0x\w+\[\'shift\'\]\(\)\);\}catch\(_0x\w+\)\{_0x\w+\[\'push\'\]\(_0x\w+\[\'shift\'\]\(\)\);\}+\s*\(\2,(0x\w+)\),\(function\(\)\{var\s?(_0x\w+)=\1,(.*?)\}\(\)\)\);function\s?\2\(\)\{var\s?_0x\w+=\[([^\]]+)\];\2=function\(\)\{return\s?_0x\w+;\};return\s?\2\(\);\}~msi',
+            'id'   => 'JS_parseIntArray',
         ],
         /*************************************************************************************************************/
         /*                                          PYTHON patterns                                                 */
@@ -11535,13 +12396,22 @@ class Deobfuscator
     private $grabed_signature_ids;
     private $active_fragment;
     private $excludes;
+    private $debugger;
+    private $isDebugMode = false;
 
-    public function __construct($text, $origin_text = '', $max_level = 30, $max_time = 5)
+    /**
+     * @param string $text
+     * @param string $origin_text
+     * @param DebugMode|null $debugger
+     * @param int $max_level
+     * @param int $max_time
+     */
+    public function __construct($text, $origin_text = '', $debugger = null, $max_level = 30, $max_time = 5)
     {
         $this->text         = $text;
         $this->full_source  = $text;
 
-        if ($this->defineSpecificObfuscator($text, $origin_text)) {
+        if ($origin_text != '' && $this->defineSpecificObfuscator($text, $origin_text)) {
             $this->text         = $origin_text;
             $this->full_source  = $origin_text;
         }
@@ -11551,6 +12421,13 @@ class Deobfuscator
         $this->fragments            = [];
         $this->grabed_signature_ids = [];
         $this->excludes             = [];
+        $this->debugger             = !is_object($debugger) ? new Debugger() : $debugger;
+        $this->isDebugMode          = defined('DEBUG_PERFORMANCE') && DEBUG_PERFORMANCE ? true : false;
+    }
+
+    public function setIsDebugMode(bool $isEnable)
+    {
+        $this->isDebugMode = $isEnable;
     }
 
     private function getPreviouslyDeclaredVars($string, $level = 0)
@@ -11608,8 +12485,10 @@ class Deobfuscator
                 (strpos($origin_text, ';return;?>') || strpos($origin_text, 'This file is protected by copyright law and provided under'))  //lockit1 || evalFileContentBySize
             || strpos($origin_text, 'The latest version of Encipher can be obtained from')  && strpos($origin_text, '\'@ev\'));')           //EvalFileContent
             || strpos($origin_text, 'substr(file_get_contents(__FILE__),')                  && strpos($origin_text, '__halt_compiler();')   //EvalFileContentOffset
-            || strpos($text, 'create_function(\'\', base64_decode(@stream_get_contents(')   && strpos($text, '@fopen(__FILE__,')            //wpKey (eval)
-            || strpos($origin_text, '//base64 - gzinflate - str_rot13 - convert_uu - gzinflate - base64')                                          //
+            || strpos($origin_text, 'gzuncompress(strrev($')                  && strpos($origin_text, '__halt_compiler();')                 //GzuncompressStrrev
+            || strpos($text, 'base64_decode(@stream_get_contents(')   && strpos($text, '@fopen(__FILE__,')            //wpKey (eval)
+            || strpos($origin_text, '//base64 - gzinflate - str_rot13 - convert_uu - gzinflate - base64')                                   //
+            || strpos($origin_text, '/* Do not change this code') && strpos($origin_text, '));__halt_compiler();')                          //B64Chunks
         ) {
             return true;
         }
@@ -11649,6 +12528,9 @@ class Deobfuscator
                 if (!isset($matches[5]) || $matches[5] === '') {
                     return '';
                 }
+                if (preg_match('~attachment;\s*filename=\\\\"\w+\.vbs~', $str)) {
+                    return '';
+                }
                 break;
             case 'eval':
                 if (strpos($matches[0], 'file_get_contents') !== false) {
@@ -11661,6 +12543,21 @@ class Deobfuscator
                     return '';
                 }
                 if (@$matches[6] === '\'";') {
+                    return '';
+                }
+                break;
+            case 'goto':
+                if (!preg_match('~\$[^\[\(\)\]=\+\-\"\']{1,20}~msi', $matches[0])) {
+                    return '';
+                }
+
+                $offset = 0;
+                $count = 0;
+                while (preg_match('~goto\s*[^;]+;\s*[^:{}]+:\s*[^;]+;~msi', $matches[0], $m, PREG_OFFSET_CAPTURE, $offset)) {
+                    $count++;
+                    break;
+                }
+                if ($count === 0) {
                     return '';
                 }
                 break;
@@ -11691,7 +12588,9 @@ class Deobfuscator
                 continue;
             }
 
-            if (preg_match($fast_regexp, $str, $matches)) {
+            $sig_type = isset($signature['fast']) ? self::TYPE_PREG_FAST : self::TYPE_PREG_FULL;
+            $matches = $this->handlePregMatch($sig_type, $signature['id'], $fast_regexp, $str);
+            if ($matches) {
                 $ret = $this->checkObfuscatorExcludes($str, $signature['id'], $matches);
                 break;
             }
@@ -11704,7 +12603,8 @@ class Deobfuscator
     private function getObfuscateFragment($str, $type)
     {
         foreach (self::$signatures as $signature) {
-            if ($signature['id'] == $type && preg_match($signature['full'], $str, $matches)) {
+            $matches = $this->handlePregMatch(self::TYPE_PREG_FULL, $signature['id'], $signature['full'], $str);
+            if ($signature['id'] == $type && $matches) {
                 return $matches;
             }
         }
@@ -11733,7 +12633,8 @@ class Deobfuscator
         reset(self::$signatures);
         while ($sign = current(self::$signatures)) {
             $regex = $sign['full'];
-            if (preg_match($regex, $str, $matches)) {
+            $matches = $this->handlePregMatch(self::TYPE_PREG_FULL, $sign['id'], $regex, $str);
+            if ($matches) {
                 $this->grabed_signature_ids[$sign['id']] = 1;
                 $this->fragments[$matches[0]] = $matches[0];
                 $str = str_replace($matches[0], '', $str);
@@ -11764,12 +12665,8 @@ class Deobfuscator
                 }
                 $find   = $match[0] ?? '';
                 $func   = 'deobfuscate' . ucfirst($type);
+                $temp = $this->handleFunc(self::TYPE_FUNC, ucfirst($type), $func, $find, $match);
 
-                try {
-                    $temp = @$this->$func($find, $match);
-                } catch (Exception $e) {
-                    $temp = '';
-                }
                 if ($temp !== '' && $temp !== $find) {
                     $value = str_replace($find, $temp, $value);
                 } else {
@@ -11799,7 +12696,7 @@ class Deobfuscator
         ini_set('pcre.backtrack_limit', self::PCRE_BACKTRACKLIMIT);
         ini_set('pcre.recursion_limit', self::PCRE_RECURSIONLIMIT);
         $deobfuscated   = '';
-        $this->run_time = microtime(true);
+        $this->run_time = Helpers::currentTime();
         $this->cur      = $this->text;
 
         $this->grabFragments();
@@ -11836,6 +12733,55 @@ class Deobfuscator
     public static function getSignatures()
     {
         return self::$signatures;
+    }
+
+    public function getDebugger() {
+        return $this->debugger;
+    }
+
+    /**
+     * @param string $sigType
+     * @param $sigId
+     * @param string $regex
+     * @param string $content
+     * @return false|array
+     */
+    private function handlePregMatch(string $sigType, $sigId, string $regex, string $content)
+    {
+        $start_time = Helpers::currentTime();
+        $isMatch = preg_match($regex, $content, $match);
+
+        if ($this->isDebugMode) {
+            $time_elapsed = Helpers::currentTime() - $start_time;
+            $this->debugger->addDeobfuscatorData($sigType, $sigId, $time_elapsed);
+        }
+
+        return $isMatch ? $match : false;
+    }
+
+    /**
+     * @param string $type
+     * @param string $funcId
+     * @param string $func
+     * @param string $find
+     * @param array $match
+     * @return string
+     */
+    private function handleFunc(string $type, string $funcId, string $func, string $find, array $match)
+    {
+        try {
+            $start_time = Helpers::currentTime();
+            $result = @$this->$func($find, $match);
+
+            if ($this->isDebugMode) {
+                $time_elapsed = Helpers::currentTime() - $start_time;
+                $this->debugger->addDeobfuscatorData($type, $funcId, $time_elapsed);
+            }
+        } catch (Exception $e) {
+            $result = '';
+        }
+
+        return $result;
     }
 
     public function unwrapFuncs($string, $level = 0)
@@ -11882,9 +12828,9 @@ class Deobfuscator
                 $args = explode(',', $arg);
                 $args[0] = substr(trim($args[0]), 0, -1);
                 $args[1] = substr(trim($args[1]), 1);
-                $res = @$function($args[0], $args[1]);
+                $res = @Helpers::executeWrapper($function, [$args[0], $args[1]]);
             } elseif ($function === 'unserialize') {
-                $res = Helpers::unserialize($arg);
+                $res = @Helpers::unserialize($arg);
             } elseif ($function === 'str_replace') {
                 $args = explode(',', $arg);
                 $args[0] = substr(trim($args[0]), 0, -1 );
@@ -11893,11 +12839,11 @@ class Deobfuscator
                     $args[1] = null;
                 }
                 $args[2] = $this->unwrapFuncs(trim($args[2]), $level + 1) ?? $args[2];
-                $res = @$function($args[0], $args[1], $args[2]);
+                $res = @Helpers::executeWrapper($function, [$args[0], $args[1], $args[2]]);
             } else if ($function === 'chr') {
-                $res = @$function((int)$arg);
+                $res = @Helpers::executeWrapper($function, [(int)$arg]);
             } else {
-                $res = @$function($arg);
+                $res = @Helpers::executeWrapper($function, [$arg]);
             }
         } else {
             $res = $arg;
@@ -12009,9 +12955,15 @@ class Deobfuscator
 
     private function deobfuscateObf_20200522_1($str, $matches)
     {
-        $find = $matches[0];
         $res = strrev(gzinflate(base64_decode(substr($matches[14], (int)hex2bin($matches[4]) + (int)hex2bin($matches[6]), (int)hex2bin($matches[8])))));
-        $res = str_replace($find, $res, $str);
+        if (preg_match('~define\(\'([^\']+)\', \'[^\']+\'\);\$GLOBALS\[\1\]\s*=\s*explode\(\'([^\']+)\',\s*gzinflate\(substr\(\'((?:[^\']*\\\\\')+[^\']+)\',([0-9a-fx]+),\s*([\-0-9a-f]+)\)~msi', $res, $m)) {
+            $m[3] = stripcslashes($m[3]);
+            $strings = explode($m[2], gzinflate(substr($m[3], hexdec($m[4]), (int)$m[5])));
+            $res = str_replace($m[0], '', $res);
+            $res = preg_replace_callback('~\$GLOBALS[\{\[].{1,3}[\}\]][\[\{]([0-9a-fx]+)[\]\}]~msi', function($m) use ($strings) {
+                return '\'' . $strings[hexdec($m[1])] . '\'';
+            }, $res);
+        }
         return $res;
     }
 
@@ -12281,7 +13233,7 @@ class Deobfuscator
             function ($match) use (&$vars) {
                 $func = $match[2];
                 if (Helpers::convertToSafeFunc($func) && isset($vars[$match[3]])) {
-                    $vars[$match[1]] = @$func($vars[$match[3]]);
+                    $vars[$match[1]] = @Helpers::executeWrapper($func, [$vars[$match[3]]]);
                     return '';
                 }
                 return $match[1] . '=' . $match[2] . '(\'' . $match[3] . '\';';
@@ -12414,9 +13366,8 @@ class Deobfuscator
         return $res;
     }
 
-    private function deobfuscateCustom1($str)
+    private function deobfuscateCustom1($str, $matches)
     {
-        preg_match('~\$\w+="([^"]+)";\$l+=0;\$l+=\'base64_decode\';\$l+=0;eval\(.+?;eval\(\$l+\);return;~msi', $str, $matches);
         return Helpers::someDecoder3($matches[1]);
     }
 
@@ -12453,6 +13404,47 @@ class Deobfuscator
         $res = strtr($res, $matches[2], $matches[3]);
         $res = str_replace($find, $res, $str);
         return $res;
+    }
+
+    private function deobfuscateLockIt3($str, $matches)
+    {
+        $totalLength = (int)$matches[1];
+        $res = $this->unwrapFuncs($matches[2]);
+        $encodedStr = $matches[3];
+
+        if (preg_match('~\$\w{1,50}\s?=\s?fopen\(\$\w{1,50}\s?,\s?[\'"]rb[\'"]\);while\(\-\-\$\w{1,50}\)fgets\(\$\w{1,50},\d+\);fgets\(\$\w{1,50},\d+\);\$\w{1,50}\s?=\s?\(?((?:gzuncompress\(|base64_decode\()+)strtr\(fread\(\$\w{1,50},(\d+)\)+,[\'"]([^\'"]+)[\'"],[\'"]([^\'"]+)[\'"](\)+);eval\(\$\w{1,50}\);~msi', $res, $m)) {
+            $length = (int)$m[2];
+            $res = substr($encodedStr, 0, $length);
+            $res = $this->unwrapFuncs($m[1] . "'" . strtr($res, $m[3], $m[4]) . $m[5]);
+
+            if (preg_match('~((?:gzuncompress\(|base64_decode\()+)strtr\(fread\(\$\w{1,50},\$\w{1,50}\),[\'"]([^\'"]+)[\'"],[\'"]([^\'"]+)[\'"](\)+);~msi',
+                $res, $m)) {
+                $res = substr($encodedStr, $length, $totalLength);
+                $res = $this->unwrapFuncs($m[1] . "'" . strtr($res, $m[2], $m[3]) . $m[4]);
+                return $res;
+            }
+        }
+
+        if (preg_match('~\$\w{1,50}\s?=\s?fopen\(\$\w{1,50}\s?,\s?[\'"]rb[\'"]\);\$\w{1,50}=(?:intval\([\'"])?(\d+)\)?(?:[\'"]\))?;fseek\(\$\w{1,50},(?:intval\([\'"])?(\d+)(?:[\'"]\))?\);eval\(base64_decode\(strtr\(fread\(\$\w{1,50},(\d+)\),[\'"]([^\'"]+)[\'"],[\'"]([^\'"]+)[\'"]\)+;return;~msi', $res, $m)) {
+            $lengthSeek = (int)$m[1] - (int)$m[2];
+            $length = (int)$m[3];
+            $res = substr($encodedStr, 0, $length);
+            $res = base64_decode(strtr($res, $m[4], $m[5]));
+
+            if (preg_match('~\(base64_decode\(strtr\(gzuncompress\(base64_decode\(fread\(\$\w{1,50},\$\w{1,50}\)+,[\'"]([^\'"]+)[\'"],[\'"]([^\'"]+)[\'"]\)+;~msi', $res, $m)) {
+                $res = substr($encodedStr, $lengthSeek, $totalLength);
+                $res = base64_decode(
+                    strtr(
+                        gzuncompress(base64_decode($res)),
+                        $m[1],
+                        $m[2]
+                    )
+                );
+                return $res;
+            }
+        }
+
+        return $str;
     }
 
     private function deobfuscateAnaski($str, $matches)
@@ -12492,12 +13484,12 @@ class Deobfuscator
         $offset = intval($matches[4]);
         $func = $matches[5];
         $eval = pack('H*',substr($substr_array, $offset));
-        $res = Helpers::convertToSafeFunc($eval) ? @$eval($matches[6]) : $matches[6];
+        $res = Helpers::convertToSafeFunc($eval) ? @Helpers::executeWrapper($eval, [$matches[6]]) : $matches[6];
         $res = preg_replace_callback('~(\w+)\(([-\d]+),\s*([-\d]+)\)~mis', static function ($matches) use ($eval, $substr_array, $func) {
             if ($matches[1] !== $func) {
                 return $matches[0];
             }
-            $res = Helpers::convertToSafeFunc($eval) ? @$eval(substr($substr_array, $matches[2], $matches[3])) : $matches[0];
+            $res = Helpers::convertToSafeFunc($eval) ? @Helpers::executeWrapper($eval, [substr($substr_array, $matches[2], $matches[3])]) : $matches[0];
             return '\'' . $res . '\'';
         }, $res);
         $res = str_replace($find, $res, $str);
@@ -12783,7 +13775,7 @@ class Deobfuscator
                 }
                 $func = Helpers::concatStr($funcs[$i] . '"');
                 if (Helpers::convertToSafeFunc($func)) {
-                    $final_code = @$func($final_code);
+                    $final_code = @Helpers::executeWrapper($func, [$final_code]);
                 }
             }
             $result = $final_code;
@@ -12972,8 +13964,26 @@ class Deobfuscator
             return $res;
         }
 
+        if (preg_match('~((?:\$\w{1,50}\s*=\s*[\'"][^\'"]+[\'"];\s*)+)error_reporting\(\d\);\s*(\$\w{1,50})\s*=\s*(\$\w{1,50})\([\'"]([^\'"]+)[\'"]\);\s*\2\s*=\s(\$\w{1,50})\(\2\);\s*\$\w{1,50}\s*=\s*\$\w{1,50}\([\'"]\$\w{1,50}[\'"]\s*,\2\);~msi', $res, $match)) {
+            $vars = Helpers::collectVars($match[0]);
+
+            $func1 = $vars[$match[3]] ?? null;
+            $func2 = $vars[$match[5]] ?? null;
+            if (Helpers::convertToSafeFunc($func1) && Helpers::convertToSafeFunc($func2)) {
+                $res = Helpers::executeWrapper($func2, [
+                    Helpers::executeWrapper($func1, [$match[4]])
+                ]);
+            }
+
+            if (substr_count($res, 'goto ') > 100) {
+                $res = Helpers::unwrapGoto($res);
+            }
+
+            return $res;
+        }
 
         $res = str_replace($find, ' ?>' . $res, $str);
+
         return $res;
     }
 
@@ -13729,16 +14739,22 @@ class Deobfuscator
 
         $result = Helpers::replaceVarsFromArray($vars, $result, true);
 
-        for ($i = 0; $i < 2; $i++) {
-            $result = preg_replace_callback('~eval\s?\(((?:(?:gzinflate|str_rot13|base64_decode)\()+\'[^\']+\'\)+);~msi',
-                function ($match) {
-                    return $this->unwrapFuncs($match[1]);
-                }, $result);
+        $found = true;
+        $hop = 50;
+        while ($found && $hop > 0) {
+            $found = false;
 
-            $result = preg_replace_callback('~eval\s?\((?:str_rot13\()+\'((?|\\\\\'|[^\'])+\')\)\);~msi',
-                function ($match) {
-                    return str_rot13($match[1]);
-                }, $result);
+            if (preg_match('~eval\s?\(((?:(?:gzinflate|str_rot13|base64_decode)\()+\'[^\']+\'\)+);~msi', $result, $evalMatch)) {
+                $result = str_replace($evalMatch[0], $this->unwrapFuncs($evalMatch[1]), $result);
+                $found = true;
+            }
+
+            if (preg_match('~eval\s?\((?:str_rot13\()+\'((?|\\\\\'|[^\'])+\')\)\);~msi', $result, $evalMatch)) {
+                $result = str_replace($evalMatch[0], $this->unwrapFuncs($evalMatch[1]), $result);
+                $found = true;
+            }
+
+            $hop--;
         }
 
         $result = preg_replace_callback(
@@ -14015,6 +15031,9 @@ class Deobfuscator
     {
         $find = $matches[0];
         $evalVar = $matches[7];
+        if (strpos($evalVar, '${$') === 0) {
+            return Helpers::postProcess($str);
+        }
         if (!$evalVar) {
             $evalVar = $matches[6];
             $pregVal = '\$\w+';
@@ -14090,9 +15109,10 @@ class Deobfuscator
         }
 
         if (preg_match('~@?stream_get_contents\(\$\w+\),\s*true~msi', $str, $matches)) {
-            if (preg_match('~(\$\w+)\s*=\s*@?fopen\(__FILE__,\s*\'\w+\'\);\s*@?fseek\(\1,\s*([0-9a-fx]+)~msi', $this->full_source, $m)) {
-                $offset = hexdec($m[2]);
-                $end = substr($this->full_source, $offset);
+            if (preg_match('~<\?php\s/{2}[\w\s]+\$\w{1,50}\s?=\s?@?\$_SERVER.*?(\$\w+)\s*=\s*@?fopen\(__FILE__,\s*\'\w+\'\);\s*@?fseek\(\1,\s*([0-9a-fx]+)~msi', $this->full_source, $m, PREG_OFFSET_CAPTURE)) {
+                $initialOffset = $m[0][1];
+                $offset = hexdec($m[2][0]);
+                $end = substr($this->full_source, $initialOffset + $offset);
                 $res = str_replace($matches[0], '\'' . $end . '\'', $str);
                 return $res;
             }
@@ -14122,7 +15142,7 @@ class Deobfuscator
             $res = str_replace('"."', '', $res);
         }
 
-        if (preg_match('~((\$\w+)\s*=\s*create_function\(\'\',\s*)[^\)]+\)+;\s*(\2\(\);)~msi', $res, $matches)) {
+        if (preg_match('~((\$\w+)\s*=\s*create_function\(\'\',\s*)[^\']+\'.*?\'\)+;\s*(\2\(\);)~msi', $res, $matches)) {
             $res = str_replace($matches[1], 'eval(', $res);
             $res = str_replace($matches[3], '', $res);
             return $res;
@@ -14327,7 +15347,7 @@ class Deobfuscator
     private function deobfuscateWso($str, $matches)
     {
         $result = $matches[0];
-        $contentVar = $matches[8];
+        $contentVar = $matches[11];
 
         preg_match_all('~(\[([-+\(\d*\/\)]+)\])+~', $result, $mathMatches);
         foreach ($mathMatches[0] as $index => $match) {
@@ -14337,10 +15357,10 @@ class Deobfuscator
             $result = str_replace("[$search]", "[$mathResult]", $result);
         }
 
-        $dictionary = $matches[2];
+        $dictionary = $matches[5];
 
         $variables = Helpers::getVarsFromDictionary($dictionary, $result);
-        $variables[$matches[6]] = $matches[7];
+        $variables[$matches[9]] = $matches[10];
 
         preg_match_all('~(\$\w+)\.=(\$\w+)~', $result, $matches);
         foreach ($matches as $index => $match) {
@@ -14357,8 +15377,14 @@ class Deobfuscator
             $result = $variables[$contentVar];
         }
 
-        if (preg_match('~(\$\w+)\s+=\s+(["\'\w\/+]+);(\$\w+)=base64_decode\(\1\);(\$\w+)=gzinflate\(\3\);eval\(\4\);~msi', $result, $match)) {
+        if (preg_match('~(\$\w+)\s*=\s*(["\'\w\/+]+);(\$\w+)=base64_decode\(\1\);(\$\w+)=gzinflate\(\3\);eval\(~msi', $result, $match)) {
             $result = gzinflate(base64_decode($match[2]));
+        }
+
+        if (preg_match('~function\s*(\w+)\s*\((\$\w+)\)\s*\{\s*return\s*(\w+)\s*\(\2,(\d+)\);\s*\}~msi', $result, $match)) {
+            $result = preg_replace_callback('~' . $match[1] . '\s*\(\'([^\']+)\'\)~msi', function ($m) {
+                return '\'' . Helpers::decodeUCSDelta($m[1]) . '\'';
+            }, $result);
         }
 
         $result = str_replace('<?php', '', $result);
@@ -14507,7 +15533,7 @@ class Deobfuscator
             $str = $varMatches[3][$index];
 
             if (Helpers::convertToSafeFunc($func_name)) {
-                $str = @$func_name($str);
+                $str = @Helpers::executeWrapper($func_name, [$str]);
             }
             $result = str_replace($varMatch, '', $result);
             $result = str_replace($var_name, $str, $result);
@@ -14522,7 +15548,7 @@ class Deobfuscator
         $func = $matches[2];
 
         if (Helpers::convertToSafeFunc($func)) {
-            $result = @$func($matches[3]);
+            $result = @Helpers::executeWrapper($func, [$matches[3]]);
             $result = str_replace('<?php', '', $result);
         }
 
@@ -14649,7 +15675,7 @@ class Deobfuscator
                 );
                 $res = "";
                 if (Helpers::convertToSafeFunc($match[2])) {
-                    $res = @$match[2]($str[$dictionaryName], $match[4]);
+                    $res = @Helpers::executeWrapper($match[2], [$str[$dictionaryName], $match[4]]);
                 }
 
                 if (Helpers::convertToSafeFunc($match[1]) && function_exists($match[1])) {
@@ -14658,8 +15684,7 @@ class Deobfuscator
                     foreach ($digits as $digit) {
                         $args[] = (int)$digit;
                     }
-                    $reflectionMethod = new ReflectionFunction($match[1]);
-                    $res              = $reflectionMethod->invokeArgs($args);
+                    $res = @Helpers::executeWrapper($match[1], $args);
                 }
                 return "\"$res\";";
             },
@@ -14771,7 +15796,7 @@ class Deobfuscator
             $argStr = $matchVars[5][$index];
 
             if (Helpers::convertToSafeFunc($func)) {
-                $value = @$func($arg1, $arg2 === 'trim' ? "" : $arg2, $argStr);
+                $value = @Helpers::executeWrapper($func, [$arg1, $arg2 === 'trim' ? "" : $arg2, $argStr]);
 
                 $vars[$varName] = $value;
             }
@@ -14780,15 +15805,15 @@ class Deobfuscator
 
         $func = $vars[$matches[10]] ?? '';
         if (Helpers::convertToSafeFunc($func)) {
-            $result = @$func($matches[11], $vars[$matches[12]] ?? "", $decodeKey);
+            $result = @Helpers::executeWrapper($func, [$matches[11], $vars[$matches[12]] ?? "", $decodeKey]);
         }
         $func = $vars[$matches[7]] ?? '';
         if (Helpers::convertToSafeFunc($func)) {
-            $result = @$func($vars[$matches[8]] ?? '', "", $result);
+            $result = @Helpers::executeWrapper($func, [$vars[$matches[8]] ?? '', "", $result]);
         }
         $func = $vars[$matches[6]] ?? '';
         if (Helpers::convertToSafeFunc($func)) {
-            $result = @$func($result);
+            $result = @Helpers::executeWrapper($func, [$result]);
         }
 
         return $result;
@@ -14900,7 +15925,7 @@ class Deobfuscator
         $func = stripcslashes($matches[1]);
 
         if (Helpers::convertToSafeFunc($func)) {
-            $result = @$func($matches[2]);
+            $result = @Helpers::executeWrapper($func, [$matches[2]]);
         }
 
         return $result;
@@ -14966,10 +15991,12 @@ class Deobfuscator
     private function deobfuscateEvalFuncVars($str, $matches)
     {
         $result = $str;
+        $matches[1] = MathCalc::calcRawString($matches[1]);
+        $matches[1] = str_replace([' ', "'.", '.\'', '".', '."'], '', $matches[1]);
         $vars = Helpers::collectFuncVars($matches[1]);
+        Helpers::collectVars($matches[1], '\'', $vars);
 
         $result = Helpers::replaceVarsFromArray($vars, $matches[2]);
-
 
         if (strpos($result, 'eval') !== false) {
             $result = $this->unwrapFuncs($result);
@@ -14979,7 +16006,16 @@ class Deobfuscator
 
     private function deobfuscateDictionaryCreateFuncs($str, $matches)
     {
-        $vars = Helpers::getVarsFromDictionary($matches[3], $matches[4]);
+        $dict = $matches[3];
+        if (stripos($dict, 'base64_decode') !== false) {
+            $dict = Helpers::replaceBase64Decode($dict);
+        }
+        if (stripos($dict, 'urldecode') !== false) {
+            $dict = urldecode(substr($dict, 11, -2));
+        }
+        $dict = trim($dict, '\'"');
+
+        $vars = Helpers::getVarsFromDictionary($dict, $matches[4]);
         $result = str_replace($matches[4], '', $str);
 
         $result = preg_replace_callback('~\${"[\\\\\w]+"}\["[\\\\\w]+"\]~msi', static function ($match) {
@@ -15054,6 +16090,9 @@ class Deobfuscator
 
     private function deobfuscateDropInclude($str, $matches)
     {
+        if (isset($matches[8]) && $matches[8] !== '') {
+            return base64_decode($matches[4]);
+        }
         $key = basename($matches[2]);
         $encrypted = base64_decode(base64_decode($matches[4]));
         return $this->deobfuscateXorFName($encrypted, null, $key);
@@ -15094,27 +16133,60 @@ class Deobfuscator
 
     private function deobfuscateEvalVarChar($str, $matches)
     {
-        $chars = Helpers::collectVarsChars($matches[1]);
-        $vars = Helpers::assembleStrings($chars, $matches[2]);
-        $str = str_replace($matches[1], '', $str);
-        $str = str_replace($matches[2], '', $str);
-        foreach ($vars as $var => $func) {
-            $str = str_replace($var, $func, $str);
+        $vars = Helpers::collectConcatedVars($matches[1]);
+        preg_match_all('~(\$\w+)=((?:\$\w+\.?)+);~msi', $matches[2], $varMatches, PREG_SET_ORDER);
+        foreach ($varMatches as $varMatch) {
+            $finalVars[$varMatch[1]] = Helpers::concatStr(
+                Helpers::replaceVarsFromArray($vars, $varMatch[2], false, true)
+            );
         }
-        return $str;
+        $res = Helpers::replaceVarsFromArray($finalVars, $matches[3], true);
+
+        return $res;
     }
 
     private function deobfuscateEvalVarFunc($str, $matches)
     {
-        $var = Helpers::collectFuncVars($matches[1]);
+        $var = Helpers::collectFuncVars($matches[1], $var, false, true);
         return $var[$matches[4]];
     }
 
     private function deobfuscateEvalVarsFuncs($str, $matches)
     {
-        $vars = Helpers::collectVars($matches[1]);
-        $vars[$matches[5]] = $matches[2];
-        $res = Helpers::replaceVarsFromArray($vars, $matches[3]);
+        $vars = Helpers::collectConcatedVars($matches[1], '"', $vars, true);
+        $matches[3] = $matches[3] === '' ? $matches[5] : 'eval(' . $matches[4] . ');';
+
+        $res = Helpers::replaceVarsFromArray($vars, $matches[3], false, true);
+        $parts = array_filter(array_map('trim', explode(';', $res)));
+        $hangs = 10;
+        foreach ($parts as &$part) {
+            while (strpos($part, 'eval') === 0 && $hangs--) {
+                $part = preg_replace_callback('~\$\w+\b(?!\s*=)~msi',
+                    function ($m) use ($vars) {
+                        return isset($vars[$m[0]]) ? '\'' . $vars[$m[0]] . '\'' : $m[0];
+                    }, $part);
+                if (substr_count($part, 'eval(') > 1) {
+                    $tmp = array_filter(array_map('trim', explode(';', $part)));
+                    foreach ($tmp as &$item) {
+                        $item = preg_replace_callback('~\$\w+\b(?!\s*=)~msi',
+                            function ($m) use ($vars) {
+                                return isset($vars[$m[0]]) ? $vars[$m[0]] : $m[0];
+                            }, $item);
+                        $item = $this->deobfuscateEval($item, []);
+                        Helpers::collectConcatedVars($item, '"', $vars, true);
+                    }
+                    unset($item);
+                    $part = implode($tmp);
+                } else {
+                    $part = $this->deobfuscateEval($part, []);
+                }
+            }
+        }
+        if (count($parts) > 1) {
+            $parts[0] = Helpers::replaceVarsFromArray($vars, $parts[0]);
+        }
+        unset($part);
+        $res = implode($parts);
         return $res;
     }
 
@@ -15149,7 +16221,6 @@ class Deobfuscator
                 $res = Helpers::replaceVarsFromArray($vars, $res);
                 if (preg_match('~eval\(base64_decode\(strtr\(~msi', $res)) {
                     $res = base64_decode(strtr($arr1, $match[1], $match[2]));
-                    $res = '<?php ' . PHP_EOL . $res;
                 }
             }
         }
@@ -15205,7 +16276,7 @@ class Deobfuscator
         $result = str_replace([$matches[1], $matches[8], $matches[10]], [$matches[2], 0, 0], $matches[7]);
 
         if (Helpers::convertToSafeFunc($matches[4])) {
-            $code = @$matches[4]($matches[6]);
+            $code = @Helpers::executeWrapper($matches[4], [$matches[6]]);
             $code = gzinflate(str_rot13($code));
         } else {
             $code = 'gzinflate(str_rot13(\'' . $matches[4] . '\')));';
@@ -15417,7 +16488,7 @@ class Deobfuscator
         $result = '';
 
         if (Helpers::convertToSafeFunc($func2) && Helpers::convertToSafeFunc($func1)) {
-            $result = '?>' . @$func1(@$func2($matches[6]));
+            $result = '?>' . @Helpers::executeWrapper($func1, [@Helpers::executeWrapper($func2, [$matches[6]])]);
         } else {
             $result = sprintf("'?>'.%s(%s('%s');", $func1, $func2, $matches[6]);
         }
@@ -15469,11 +16540,11 @@ class Deobfuscator
 
         $result = '';
         if (Helpers::convertToSafeFunc($func2Str)) {
-            $result = @$func2Str($strToDecode);
+            $result = @Helpers::executeWrapper($func2Str, [$strToDecode]);
         }
 
         if (preg_match('~eval\(\$\w+\);~msi', $func1Str) && Helpers::convertToSafeFunc($func2Str)) {
-            $result = @$func2Str($strToDecode);
+            $result = @Helpers::executeWrapper($func2Str, [$strToDecode]);
             $result = stripcslashes($result);
             $vars = Helpers::collectVars($result);
             if (preg_match('~\$\w+=\$\w+\([\'"]\([\'"],__FILE.*?(?:\$\w+\(){3}[\'"][^\'"]+[\'"]\)\)\)\);~msi', $result,
@@ -15595,7 +16666,7 @@ class Deobfuscator
 
         $func = $vars[$matches[5]] ?? null;
         if ($func && Helpers::convertToSafeFunc($func)) {
-            $result = @$func($matches[6]);
+            $result = @Helpers::executeWrapper($func, [$matches[6]]);
         }
 
         $result = Helpers::replaceVarsFromArray($vars, $result);
@@ -15745,7 +16816,7 @@ class Deobfuscator
 
     private function deobfuscateManyBase64DecodeContent($str)
     {
-        return Helpers::replaceBase64Decode($str, "'");
+        return Helpers::replaceBase64Decode($str);
     }
 
     private function deobfuscateEvalEscapedCharsContent($str, $matches)
@@ -15942,7 +17013,7 @@ class Deobfuscator
         $varsStr = Helpers::replaceVarsFromDictionary($matches[1], $matches[2], $matches[3]);
         $vars = Helpers::collectVars($varsStr, "'");
         if (isset($vars[$matches[6]]) && Helpers::convertToSafeFunc($vars[$matches[6]])) {
-            $strToDecode = @$vars[$matches[6]]($matches[2]);
+            $strToDecode = @Helpers::executeWrapper($vars[$matches[6]], [$matches[2]]);
             $strToDecode = preg_replace('~[' . $matches[5] . ']~i', '', $strToDecode);
             $strToDecode = pack('H*', $strToDecode);
 
@@ -16307,7 +17378,7 @@ class Deobfuscator
 
         $res = Helpers::decodefuncDictVars($matches[23], 1);
         if (isset($vars[$matches[22]]) && Helpers::convertToSafeFunc($vars[$matches[22]])) {
-            $res = @$vars[$matches[22]]($res);
+            $res = @Helpers::executeWrapper($vars[$matches[22]], [$res]);
             $res = Helpers::replaceVarsFromArray($vars, $res);
         }
 
@@ -16590,7 +17661,7 @@ class Deobfuscator
             $m[3] = stripcslashes($m[3]);
             $strings = explode($m[2], gzinflate(substr($m[3], hexdec($m[4]), (int)$m[5])));
             $res = str_replace($m[0], '', $res);
-            $res = preg_replace_callback('~\$GLOBALS[\{\[].[\}\]][\[\{]([0-9a-fx]+)[\]\}]~msi', function($m) use ($strings) {
+            $res = preg_replace_callback('~\$GLOBALS[\{\[].{1,3}[\}\]][\[\{]([0-9a-fx]+)[\]\}]~msi', function($m) use ($strings) {
                 return '\'' . $strings[hexdec($m[1])] . '\'';
             }, $res);
         }
@@ -17106,9 +18177,19 @@ class Deobfuscator
 
     private function deobfuscateDeltaOrd($str, $matches)
     {
-        $str = gzinflate(base64_decode(stripcslashes($matches[4])));
+        $matches[4] = str_replace(' ', '', $matches[4]);
+        if (isset($matches[3]) && $matches[3] !== '') {
+            $funcs = array_reverse(array_filter(explode('(', $matches[6])));
+            $str = $matches[7];
+            foreach ($funcs as $func) {
+                $str = Helpers::executeWrapper($func, [$str]);
+            }
+        } else {
+            $str = gzinflate(base64_decode(stripcslashes($matches[7])));
+        }
+
         for($i = 0, $iMax = strlen($str); $i < $iMax; $i++) {
-            $str[$i] = chr(ord($str[$i]) + (int) $matches[3]);
+            $str[$i] = chr(ord($str[$i]) + (int) $matches[4]);
         }
         return $str;
     }
@@ -17406,7 +18487,7 @@ class Deobfuscator
                     return '\'' . stripcslashes($m[2]) . '\'';
                 }
                 if (Helpers::convertToSafeFunc($m[1])) {
-                    return '\'' . $m[1]($m[2]) . '\'';
+                    return '\'' . @Helpers::executeWrapper($m[1], [$m[2]]) . '\'';
                 }
                 return $m[0];
             }, $code);
@@ -17437,8 +18518,9 @@ class Deobfuscator
 
     private function deobfuscateMaskedDeltaOrd($str, $matches)
     {
-        $matches[4] = base64_decode($matches[2]);
-        $matches[3] = '-1';
+        $matches[3] = '';
+        $matches[7] = base64_decode($matches[2]);
+        $matches[4] = '-1';
         return $this->deobfuscateDeltaOrd($str, $matches);
     }
 
@@ -17673,7 +18755,8 @@ class Deobfuscator
     {
         $b64str = str_replace('\',\'', '', $matches[2]);
         $code = gzuncompress(base64_decode($b64str));
-        $code = Helpers::normalize(MathCalc::calcRawString($code));
+        $code = MathCalc::calcRawString($code);
+        $code = Helpers::normalize($code);
         $arr = [];
         $func = '';
         $code = preg_replace_callback('~if\(!function_exists\(\'(\w+)\'\)\)\{function\s*\1\((\$\w+)\)\s*\{(\$\w+)=array\(([^)]+)\);return\s*base64_decode\(\3\[\2\]\);\}~msi', function ($m) use (&$arr, &$func) {
@@ -17731,9 +18814,17 @@ class Deobfuscator
     {
         $decode = str_rot13($matches[2]);
         $decode = stripcslashes($decode);
-        $decode = preg_replace(['~eval\(convert_uudecode\(\s*\'~msi', '~\'\)\);~msi'], '', $decode);
-        $decode = stripcslashes($decode);
-        $decode = convert_uudecode($decode);
+        if (preg_match('~eval\(convert_uudecode\(\s*\'~msi', $decode)) {
+            $decode = preg_replace(['~eval\(convert_uudecode\(\s*\'~msi', '~\'\)\);~msi'], '', $decode);
+            $decode = stripcslashes($decode);
+            $decode = convert_uudecode($decode);
+        }
+        if (preg_match('~eval\(strrev\(\s*\'~msi', $decode)) {
+            $decode = preg_replace(['~eval\(strrev\(\s*\'~msi', '~\'\)\);~msi'], '', $decode);
+            $decode = stripcslashes($decode);
+            $decode = strrev($decode);
+        }
+
         $decode = $this->deobfuscateEval($decode, []);
         if (preg_match('~eval\(strrev\(\s*\';\)\)\s*\\\\\'eval\(convert_uudecode\(\s*\\\\(["\'])((?:[^;]+;)+[^\']+)\\\\\'\\\\\\\\\)\);\\\\\1\s*\(verrts\(lave\'\s*\)\);~msi', $decode, $m)) {
             $decode = preg_replace_callback('~(?:(\\\\\\\\\\\\\\\\\\\\\')|(\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\)|(\\\\\\\\))~m', function($g) {
@@ -17748,6 +18839,28 @@ class Deobfuscator
                 }
             }, $m[2]);
             $decode = convert_uudecode($decode);
+        }
+        if (preg_match('~eval\(str_rot13\(\s*\'riny\(pbaireg_hhqrpbqr\(\s*\\\\(["\'])((?:[^;]+;)+[^\']+)\\\\\'\)\);\1\s*\)\);~msi', $decode, $m)) {
+            $decode = preg_replace_callback('~(?:(\\\\\\\\\\\\\')|(\\\\\\\\\\\\\\\\))~msi', function($g) {
+                if (isset($g[1]) && $g[1] !== '') {
+                    return '\'';
+                }
+                if (isset($g[2]) && $g[2] !== '') {
+                    return '\\';
+                }
+            }, $m[2]);
+            $decode = convert_uudecode(str_rot13($decode));
+        }
+        if (preg_match('~eval\(strrev\(\s*\';\)\)\s*\\\\\'eval~msi', $decode)) {
+            $decode = preg_replace(['~eval\(strrev\(\s*\';\)\)\s*\\\\\'~msi', '~\\\\\'\s*\(verrts\(lave\'\s*\)\);~msi'], '', $decode);
+            $decode = preg_replace_callback('~(?:(\\\\\')|(\\\\\\\\))~msi', function($g) {
+                if (isset($g[1]) && $g[1] !== '') {
+                    return '\'';
+                }
+                if (isset($g[2]) && $g[2] !== '') {
+                    return '';
+                }
+            }, $decode);
         }
         return $decode;
     }
@@ -17825,6 +18938,944 @@ class Deobfuscator
         return $str;
     }
 
+    private function deobfuscateTwoCalcClasses($str, $matches)
+    {
+        $func1_name     = $matches[1] . '::' . $matches[2];
+        $func1_data     = Helpers::prepareArray($matches[3]);
+        $array_name     = Helpers::normalize($matches[4]);
+        $array          = Helpers::prepareArray($matches[5]);
+        $global_list    = Helpers::replaceBase64Decode(Helpers::normalize($matches[6]));
+        $func2_name     = $matches[7] . '::' . $matches[8];
+        $func2_data     = Helpers::prepareArray(Helpers::normalize($matches[9]));
+        $content        = Helpers::normalize($matches[10]);
+
+        $list_of_globals = [];
+        foreach (explode(";", $global_list) as $item) {
+            if (empty($item)) {
+                continue;
+            }
+            list($key, $value) = explode('=', $item, 2);
+            $list_of_globals[$key] = trim($value, '\'');
+        }
+
+        $content = str_replace(array_keys($list_of_globals), array_values($list_of_globals), $content);
+
+        $content = preg_replace_callback('~' . preg_quote($func1_name) . '\(([\d]*)\)~mis', function($m) use ($func1_data) {
+            $key = octdec($m[1]);
+            $result = '';
+            if (array_key_exists($key, $func1_data)) {
+                $result = $func1_data[$key];
+            }
+            return $result;
+        }, $content);
+
+
+        $content = preg_replace_callback('~' . preg_quote($func2_name) . '\(["\']([^\'"]+)["\'],\s*["\']([^\'"]+)["\']\)~mis', function($m) use ($func2_data) {
+            $param1 = $m[1];
+            $param2 = $m[2];
+
+            $slen = strlen($param2);
+            $decoded = base64_decode($func2_data[$param1]);
+            for ($i = 0, $cslen = strlen($decoded); $i !== $cslen; ++$i) {
+                $decoded[$i] = chr(ord($decoded[$i]) ^ ord($param2[$i % $slen]));
+            }
+            return "'".$decoded."'";
+        }, $content);
+
+
+        $content = preg_replace_callback('~\$GLOBALS\["' . preg_quote($array_name) . '"\]\[([0-9\-]+)\]~i', function ($m) use ($array) {
+            $key = octdec($m[1]);
+            return $array[$key];
+        }, $content);
+
+        return MathCalc::calcRawString($content);
+    }
+
+    private function deobfuscateCreateFuncArray($str, $matches)
+    {
+        $dict = substr(str_replace(['","', "','", '\',"', '",\''], '', $matches[2]),1, -1);
+        $func = substr(Helpers::replaceVarsFromDictionary($matches[1], $dict, $matches[5]), 1, -1);
+        $codeVar = str_replace(['"."', '\'.\'', '\'."', '".\''], '', $matches[4]);
+        $res = str_replace($codeVar, '\'' . $matches[6] . '\'', $func);
+        return $res;
+    }
+
+    private function deobfuscateCreateFuncReplaceB64($str, $matches)
+    {
+        $func1 = str_ireplace($matches[4], $matches[5], $matches[6]);
+        $func2 = strtr($matches[8], $matches[9], $matches[10]);
+        if ($func1 === 'create_function') {
+            $func1 = 'eval';
+        }
+        $code = $func1 . '(' . $func2 . '(\'' . $matches[2] . '\'' . '));';
+        return $code;
+    }
+
+    private function deobfuscateEvalTrim($str, $matches)
+    {
+        $vars = Helpers::collectFuncVars($matches[1], $vars, false);
+        $func = strtolower(substr(str_replace('\'.\'', '', Helpers::replaceVarsFromArray($vars, $matches[4], false, true)), 1, -1));
+        return 'eval(' . $func . '(\'' . $matches[6] . '\'));';
+    }
+
+    private function deobfuscateUnserializeB64GzJoinArr($str, $matches)
+    {
+        $arr = [];
+        preg_match_all('~\'([^\']*)\'~msi', $matches[5], $strMatches, PREG_SET_ORDER);
+        foreach ($strMatches as $strMatch) {
+            $arr[] = $strMatch[1];
+        }
+        $string = join($matches[4], $arr);
+        $res = gzinflate(base64_decode($string));
+        Helpers::unserialize($res);
+
+        return $res;
+    }
+
+    private function deobfuscateEvalStrrevCode($str, $matches)
+    {
+        return strrev($matches[1]);
+    }
+
+    private function deobfuscateEvalConvertUudecodeWithSlashedQuote($str, $matches)
+    {
+        return convert_uudecode(stripcslashes($matches[1]));
+    }
+
+    private function deobfuscateDictVarsContent($str, $matches)
+    {
+        $res = Helpers::replaceVarsFromDictionary($matches[1], $matches[2], $matches[3]);
+        $vars = Helpers::collectVars($res, "'", $vars, false);
+
+        $res = str_replace($matches[3], $res, $matches[0]);
+        $res = stripcslashes($res);
+        $res = Helpers::replaceVarsFromArray($vars, $res, true);
+
+        return $res;
+    }
+
+    private function deobfuscateGlobalsCreateFuncEvalB64($str, $matches)
+    {
+        return str_replace(
+            $matches[4],
+            '?> '. base64_decode($matches[8]) . '<?php ',
+            $str
+        );
+    }
+
+    private function deobfuscateDictForeachVars($str, $matches)
+    {
+        $dictStr = $matches[2];
+        $vars = [];
+        $res = $str;
+
+        preg_match_all('~foreach\s?\(\[([^]]+)\]\s?as\s?\$\w{1,50}\)\s?{\s?(\$\w{1,50})\s?\.=\s?\$\w{1,50}\[\$\w{1,50}\];\s?}~msi', $str, $foreachMatches, PREG_SET_ORDER);
+
+        foreach ($foreachMatches as $foreachMatch) {
+            preg_match_all('~\d+~msi', $foreachMatch[1], $numMatches, PREG_SET_ORDER);
+            $val = '';
+            foreach ($numMatches as $numMatch) {
+                $val .= $dictStr[$numMatch[0]] ?? '';
+            }
+            $vars[$foreachMatch[2]] = $val;
+            $res = str_replace($foreachMatch[0], '', $res);
+        }
+
+        $res = Helpers::replaceVarsFromArray($vars, $res, true);
+        $res = Helpers::concatStringsInContent($res);
+
+        return $res;
+    }
+
+    private function deobfuscateEchoEvalGzB64Var($str, $matches)
+    {
+        return stripcslashes(gzinflate(base64_decode(stripcslashes($matches[4]))));
+    }
+
+    private function deobfuscateTwoEvalVarsReplace($str, $matches)
+    {
+        $vars = [];
+        $varsStrCode = urldecode(hex2bin($matches[3]));
+        $vars = Helpers::collectFuncVars($varsStrCode, $vars, false);
+        $res = hex2bin($matches[4]);
+
+        $unwrappedCode = Helpers::replaceVarsFromArray($vars, $matches[5]);
+        $unwrappedCode = str_replace($matches[1], $matches[2], $unwrappedCode);
+        $unwrappedCode = $this->unwrapFuncs($unwrappedCode . ')');
+
+        $res .= $unwrappedCode;
+
+        return $res;
+    }
+
+    private function deobfuscateEvalFuncCode($str, $matches)
+    {
+        $function = $matches[1];
+        $safe = Helpers::convertToSafeFunc($function);
+        if ($safe) {
+            return @Helpers::executeWrapper($function, [stripcslashes($matches[2])]);
+        }
+
+        return $str;
+    }
+
+    private function deobfuscateEvalOpenSslDecrypt($str, $matches)
+    {
+        return openssl_decrypt(
+            base64_decode($matches[1]),
+            $matches[2],
+            base64_decode($matches[3]),
+            OPENSSL_RAW_DATA,
+            base64_decode($matches[4])
+        );
+    }
+
+    private function deobfuscateUrldecodedDictVarReplace($str, $matches)
+    {
+        $dictVal = urldecode($matches[2]);
+        $res = Helpers::replaceVarsFromDictionary($matches[1], $dictVal, $matches[0]);
+        $res = Helpers::concatStringsInContent($res);
+
+        return $res;
+    }
+
+    private function deobfuscateZymdecrypt($str, $matches)
+    {
+        $funcs = Helpers::replaceBase64Decode($matches[2]);
+        $tmp = explode(';', $funcs);
+        $funcs = [];
+        foreach ($tmp as $func) {
+            if (empty($func)) {
+                continue;
+            }
+            $func = explode('=', $func);
+            $funcs[str_replace(['$' . $matches[1] . '[\'', '\']'], '', $func[0])] = substr($func[1], 1, -1);
+        }
+        foreach($funcs as $var => $func) {
+            $matches[3] = str_replace('$GLOBALS[\'' . $matches[1] . '\'][\'' . $var . '\']\(', $func . '(', $matches[3]);
+            $matches[3] = str_replace('$GLOBALS[\'' . $matches[1] . '\'][\'' . $var . '\']', $func, $matches[3]);
+        }
+
+        if (preg_match('~function\s*(\w+)\((\$\w+)\)\{return\s*base64_decode\(\2\);~msi', $matches[3], $m)) {
+            $matches[3] = str_replace($m[1] . '(', 'base64_decode(', $matches[3]);
+        }
+        $limit = 10;
+        while (
+            strpos($matches[3], 'base64_decode(\'') !== false
+            || strpos($matches[3], 'base64_decode("') !== false
+            || $limit--
+        ) {
+            $matches[3] = Helpers::replaceBase64Decode($matches[3]);
+        }
+        return $matches[3];
+    }
+
+    private function deobfuscateFuncRevB64($str, $matches)
+    {
+        $code = str_replace(['eval(' . $matches[1] . '(', '));'], ['eval(base64_decode(strrev(base64_decode(strrev(', ')))));'], $matches[4]);
+        return $code;
+    }
+
+    private function deobfuscateCreateFuncGzConvertUudecode($str, $matches)
+    {
+        return stripcslashes(gzinflate(convert_uudecode(stripcslashes($matches[2]))));
+    }
+
+    private function deobfuscateGlobalsArrayFuncs($str, $matches)
+    {
+        $globalFuncStr = base64_decode(Helpers::concatStr($matches[2]));
+        $res = str_replace($matches[1] . '(0)', '\'' . $globalFuncStr . '\'', $str);
+        preg_match_all('~(?:[\'"][^"\']*[\'"]\s?\.?)+~msi', $matches[4], $strings, PREG_SET_ORDER);
+        $vars = [];
+        foreach ($strings as $string) {
+            $vars[] = base64_decode(Helpers::concatStr($string[0]));
+        }
+        $res = preg_replace_callback(
+            '~' . $matches[3] . '\((\d+)\)~msi',
+            static function ($m) use ($vars) {
+                $str = str_replace('\\', '\\\\', $vars[$m[1]]);
+                $str = str_replace('\'', '\\\'', $str);
+                return '\'' . $str . '\'';
+            },
+            $res
+        );
+        $res = MathCalc::calcRawString($res);
+
+        return $res;
+    }
+
+    private function deobfuscateVarArrayChrFunc($str, $matches)
+    {
+        preg_match_all(
+            '~[\'"]([^\'"]+)[\'"]\s?=>(?:((?:\s?\w{1,50}\(\d{1,5}\)\.?)+)|\s?(\$\w{1,50})),~msi',
+            $str,
+            $arrMatches,
+            PREG_SET_ORDER
+        );
+        $vars = [];
+        foreach ($arrMatches as $arrMatch) {
+            $value = '';
+            if (!empty($arrMatch[2])) {
+                preg_match_all('~\d{1,5}~msi', $arrMatch[2], $numbers, PREG_SET_ORDER);
+                foreach ($numbers as $number) {
+                    $value .= $number[0] < 128 ? chr($number[0]) : '';
+                }
+            } else {
+                $value = $arrMatch[3] ?? '';
+            }
+            $vars[$arrMatch[1]] = $value;
+        }
+        $str = preg_replace_callback(
+            '~\\' . $matches[1] . '\[[\'"]([^\'"]+)[\'"]]([\[\](])~msi',
+            static function ($m) use ($vars) {
+                $value = $vars[$m[1]] ?? '';
+                if ($m[2] === ']') {
+                    $value = '\'' . $value . '\'';
+                }
+                return $value . $m[2];
+            },
+            $str
+        );
+
+        return $str;
+    }
+
+    private function deobfuscateFuncDictB64($str, $matches)
+    {
+        $matches[5] = Helpers::replaceVarsFromDictionary($matches[3], $matches[4], $matches[5]);
+        $vars = Helpers::collectVars($matches[5], '\'');
+        $code = stripcslashes($matches[8]) . ';';
+        $code = Helpers::replaceVarsFromArray($vars, $code, true, false);
+        $code = $this->deobfuscateEval($code, []);
+        $code = $matches[2] . $code;
+        return $code;
+    }
+
+    private function deobfuscateGzuncompressStrrev($str, $matches)
+    {
+        return gzuncompress(strrev($matches[4]));
+    }
+
+    private function deobfuscateEvalB64DoubleVar($str, $matches)
+    {
+        $func = trim(base64_decode($matches[4]));
+        if (!Helpers::convertToSafeFunc($func)) {
+            return $str;
+        }
+        return $func($func($matches[2]));
+    }
+
+    private function deobfuscateEvalOpensslDecryptStr($str, $matches)
+    {
+        $code = openssl_decrypt(
+            base64_decode($matches[7]),
+            "AES-256-CBC",
+            $matches[2],
+            0,
+            $matches[3]
+        );
+        $code = str_replace($matches[4], $matches[5], $code);
+
+        return $code;
+    }
+
+    private function deobfuscateEvalDictionaryFuncVar($str, $matches)
+    {
+        $code = Helpers::concatStringsInContent(
+            str_replace(
+                '\\\'',
+                '',
+                Helpers::replaceVarsFromDictionary($matches[2], $matches[3], $matches[4])
+            )
+        );
+        return substr($code, 1, -1). stripcslashes($matches[5]);
+    }
+
+    private function deobfuscateDictionaryStrReplace($str, $matches)
+    {
+        $dict = base64_decode(str_replace($matches[4], '', $matches[2]));
+        $code = Helpers::replaceVarsFromDictionary($matches[5], $dict, $matches[6]);
+        return $code;
+    }
+
+    private function deobfuscateManyBase64DecodeChr($str, $matches)
+    {
+        $code = MathCalc::calcRawString($matches[0]);
+
+        $hangs = 10;
+        while (stripos($code, 'base64_decode') !== false && $hangs--) {
+            $code = Helpers::normalize($code);
+            $code = Helpers::replaceBase64Decode($code);
+            $vars = Helpers::collectVars($code, '\'', $vars, true);
+            $code = Helpers::replaceVarsFromArray($vars, $code);
+        }
+        return $code;
+    }
+
+    private function deobfuscateManyB64CalcEval($str, $matches)
+    {
+        $code = MathCalc::calcRawString($str);
+        $limit = 50;
+        while (
+            strpos($code, 'base64_decode(\'') !== false
+            || strpos($code, 'base64_decode("') !== false
+            || $limit--
+        ) {
+            $code = Helpers::replaceBase64Decode($code);
+        }
+        $code = str_replace(['{\'', '\'}'], '', $code);
+
+        if (preg_match(
+            '~(\$\w{1,50})\s?=\s?[\'"]([^\'"]+)[\'"];\s?((?:\$\w{1,50}\s?\.?=\s?(?:\$\w{1,50}\[\d{1,5}\]\s?\.?\s?)+;\s?)+)eval\((\$\w{1,50})\s?\([\'"]([^\'"]+)[\'"]\)\);~msi',
+            $code,
+            $found
+        )) {
+            $vars[$found[1]] = $found[2];
+            $vars = Helpers::getVarsFromDictionaryDynamically($vars, $found[0]);
+            $func = $vars[$found[4]];
+            if (!Helpers::convertToSafeFunc($func)) {
+                return $code;
+            }
+            $res = $func($found[5]);
+            $res = Helpers::replaceVarsFromArray($vars, $res, true);
+
+            if (preg_match(
+                '~(\$\w{1,50})=[\'"]([^\'"]+)[\'"];eval\(\'\?>\'\.base64_decode\(strtr\(substr\(\1,(\$\w{1,50})\*2\),substr\(\1,\3,\3\),substr\(\1,0,\3\)\)\)\);~msi',
+                $res,
+                $m
+            )) {
+                if (isset($vars[$m[3]])) {
+                    $num = (int)$vars[$m[3]];
+                    return '?> ' . base64_decode(
+                        strtr(
+                            substr($m[2], $num * 2),
+                            substr($m[2], $num, $num),
+                            substr($m[2], 0, $num)
+                        )
+                    );
+                }
+            }
+        }
+        return $code;
+    }
+
+    private function deobfuscateDa7Q9RnPjm($str, $matches)
+    {
+        $dict = str_replace($matches[5], 'base64_decode', $matches[7]);
+        $dict = Helpers::replaceBase64Decode($dict);
+        $dict = explode('\',\'', substr($dict, 1, -1));
+        foreach ($dict as $index => $item) {
+            $matches[8] = str_replace($matches[6] . '[' . $index . ']', '\'' . $item . '\'', $matches[8]);
+        }
+        $matches[8] = Helpers::normalize($matches[8]);
+        $tmp = explode(';', $matches[8]);
+        $vars = [];
+        foreach ($tmp as $var) {
+            $parts = explode('=', $var);
+            $vars[$parts[0]] = $parts[1];
+        }
+        $vars = array_filter($vars);
+        foreach ($dict as $index => $item) {
+            $matches[11] = str_replace($matches[6] . '[' . $index . ']', '\'' . $item . '\'', $matches[11]);
+        }
+        foreach ($vars as $var => $val) {
+            $matches[11] = str_replace($var, $val, $matches[11]);
+        }
+        $code = substr(Helpers::normalize($matches[11]), 1, -1);
+        $code = str_replace($matches[4], '\'' . $matches[2] . '\'', $code);
+        return $code;
+    }
+
+    private function deobfuscateGarbageComments($str, $matches)
+    {
+        $res = preg_replace('~/\*[^/]*/?\*/~msi', '', $str);
+        $res = str_replace('\'.\'', '', $res);
+        return $res;
+    }
+
+    private function deobfuscateEvalVarsB64Concated($str, $matches)
+    {
+        $vars = [];
+        $code = Helpers::concatStringsInContent($str);
+        $vars = Helpers::collectFuncVars($code, $vars);
+        $vars = Helpers::collectVars($code, '"', $vars);
+
+        return Helpers::replaceVarsFromArray($vars, $matches[1]);
+    }
+
+    private function deobfuscateStrReplaceVarsCreateFunc($str, $matches)
+    {
+        $vars = [];
+        $vars = Helpers::collectVars($str, '"', $vars);
+
+        preg_match_all(
+            '~(\$\w{1,50})\s?=\s?(?:str_replace|\$\w{1,50})\([\'"]([^\'"]+)[\'"],\s*[\'"]{2},\s*[\'"]([^\'"]+)[\'"]\);\s*~msi',
+            $str, $replaces, PREG_SET_ORDER
+        );
+
+        foreach ($replaces as $replace) {
+            $vars[$replace[1]] = str_replace($replace[2], '', $replace[3]);
+        }
+
+        $strToDecode = Helpers::concatStringsInContent(
+            Helpers::replaceVarsFromArray($vars, $matches[4], false, true)
+        );
+        $funcs = Helpers::replaceVarsFromArray($vars, $matches[2]);
+        if ($funcs === 'base64_decode(str_replace(') {
+            return base64_decode(str_replace($matches[3], '', $strToDecode));
+        }
+
+        return $str;
+    }
+
+    private function deobfuscateLongVarConcatStrRot13B64Gz($str, $matches)
+    {
+        $vars = [];
+        $vars = Helpers::collectVars($str, '"', $vars);
+
+        $strToDecode = '';
+        foreach ($vars as $var) {
+            $strToDecode .= $var;
+        }
+        $res = $strToDecode;
+        preg_match_all(
+            '~str_rot13|base64_decode|gzinflate~msi',
+            $str, $funcs, PREG_SET_ORDER
+        );
+        foreach ($funcs as $func) {
+            if (Helpers::convertToSafeFunc($func[0])) {
+                $res = @$func[0]($res);
+            }
+        }
+
+        return $res;
+    }
+
+    private function deobfuscatecreateFuncDict($str, $matches)
+    {
+        $vars = Helpers::collectVars($str, '\'', $vars, true);
+        $vars2 = [];
+        foreach($vars as $k => $v) {
+            if (strlen($v) === 1) {
+                $vars2[$k] = $v;
+            } else {
+                $tmp = str_split($v);
+                foreach ($tmp as $i => $char) {
+                    $vars2[$k . '[' . $i . ']'] = $char;
+                    $vars2[$k . '[\'' . $i . '\']'] = $char;
+                }
+            }
+        }
+        $res = Helpers::replaceVarsFromArray($vars2, $str, false, true);
+        $res = Helpers::normalize($res);
+        return $res;
+    }
+
+    private function deobfuscateCreateFuncArrayPop($str, $matches)
+    {
+        return substr($matches[4], 1, -1);
+    }
+
+    private function deobfuscateChrOrdB64FuncVars($str, $matches)
+    {
+        $vars = Helpers::collectFuncVars($matches[0]);
+        $func1 = $vars[$matches[4]] ?? '';
+        $func2 = $vars[$matches[5]] ?? '';
+        if ($func1 === 'chr' && $func2 === 'ord') {
+            $strDecode = base64_decode($matches[2]);
+            $res = '';
+            $len = strlen($matches[2]);
+            for ($i = 0; $i < $len; $i++) {
+                $res .= chr(ord($strDecode[$i]) ^ (int)$matches[6]);
+            }
+
+            return $res;
+        }
+
+        return $str;
+    }
+
+    private function deobfuscateSimpleEvalFunctions($str, $matches)
+    {
+        $func1 = trim(Helpers::normalize($matches[2]), "'\"");
+        $func2 = trim(Helpers::normalize($matches[4]), "'\"");
+        $data = $matches[6];
+        if (Helpers::isSafeFunc($func1) && Helpers::isSafeFunc($func2)) {
+            return $func1($func2($data));
+        }
+        return $str;
+    }
+
+    private function deobfuscateClassArrayDictFunc($str, $matches)
+    {
+        $arrayDict = [];
+        preg_match_all(
+            '~[\'"]([^\'"]+)[\'"]\s?=>\s?((?:\s?[\'"][^\'"]*[\'"]\s?\.?)+)[,)]~msi',
+            $matches[12],
+            $dicts,
+            PREG_SET_ORDER
+        );
+        foreach ($dicts as $dict) {
+            $arrayDict[$dict[1]] = $dict[2] !== '' ? Helpers::concatStr($dict[2]) : '';
+        }
+
+        $res = $matches[13];
+
+        $res = preg_replace_callback(
+            '~' . $matches[1] . '::' . $matches[3] . '\(([^,]+),([^)]+)\)~msi',
+            static function ($m) use ($arrayDict) {
+                $arg1 = Helpers::concatStr($m[1]);
+                $arg2 = Helpers::concatStr($m[2]);
+                $n = strlen($arg2);
+
+                $decoded  = base64_decode($arrayDict[$arg1]);
+
+                for ($i = 0, $len = strlen($decoded); $i !== $len; ++$i) {
+                    $decoded[$i] = chr(ord($decoded[$i]) ^ ord($arg2[$i % $n]));
+                }
+
+                return '\'' . $decoded . '\'';
+            },
+            $res
+        );
+
+        return $res;
+    }
+
+    private function deobfuscateConcatVarsIterDict($str, $matches)
+    {
+        $res = '';
+        $strEncoded = '';
+        $dict1 = stripcslashes($matches[5]);
+        $dict2 = stripcslashes($matches[7]);
+
+        preg_match_all('~"([^"]+)"~msi', $matches[3], $strings, PREG_SET_ORDER);
+        foreach ($strings as $string) {
+            $strEncoded .= stripcslashes($string[1]);
+        }
+        foreach (str_split($strEncoded) as $c) {
+            $res .= (strpos($dict2, $c) === false) ? $c : $dict1[strpos($dict2, $c)];
+        }
+        $res = "?> $res";
+
+        return $res;
+    }
+
+    private function deobfuscateFuncB64TwoArgs($str, $matches)
+    {
+        $arg1 = base64_decode($matches[7]);
+        $arg2 = $matches[8];
+
+        $res = "";
+        for ($i = 0; $i < strlen($arg1);) {
+            for ($j = 0; $j < strlen($arg2); $j++, $i++) {
+                $res .= $arg1[$i] ^ $arg2[$j];
+            }
+        }
+
+        return $res;
+    }
+
+    private function deobfuscateStrReplaceB64($str, $matches)
+    {
+        $vars = Helpers::collectFuncVars($str, $vars, true, true);
+        $code = Helpers::replaceBase64Decode($str);
+        Helpers::collectFuncVars($code, $vars, false, true);
+        $code = Helpers::replaceVarsFromArray($vars, $code, false, false);
+        $code = Helpers::normalize($code);
+        return $code;
+    }
+
+    private function deobfuscateCreateFuncStrReplace($str, $matches)
+    {
+       return str_replace($matches[2], '', $matches[3]);
+    }
+
+    private function deobfuscateFwriteB64Shell($str, $matches)
+    {
+        return Helpers::replaceBase64Decode($str);
+    }
+
+    private function deobfuscateCreateFuncB64StrRotChr($str, $matches)
+    {
+        $code = MathCalc::calcRawString($str);
+        $code = preg_replace_callback('~str_rot13\(\'([^\']+)\'\)~msi', function ($m) {
+            return '\'' . str_rot13($m[1]) . '\'';
+        }, $code);
+        $code = Helpers::replaceBase64Decode($code);
+        $code = Helpers::normalize($code);
+        $code = Helpers::replaceBase64Decode($code);
+        if (preg_match('~(\$\w+)=create_function\(\'(\$\w+)\',\'eval\(\2\);\'\);\1\(\'([^\']+)\'\);~msi', $code, $m)) {
+            $code = $m[3];
+        }
+        return $code;
+    }
+
+    private function deobfuscateCreateFuncGzuncompressB64($str, $matches)
+    {
+         $code = gzuncompress(base64_decode(substr($matches[5], 1, -1)));
+         if (strpos($code, '1;}') === 0) {
+             $code = substr($code, 3);
+         }
+         if (substr_count($code, 'goto ') > 100) {
+             $code = Helpers::unwrapGoto($code);
+         }
+         return $code;
+    }
+
+    private function deobfuscateGlobalsSlashed($str, $matches)
+    {
+        return stripcslashes($str);
+    }
+
+    private function deobfuscateB64VarsFuncEval($str, $matches)
+    {
+        $vars = [];
+        $vars = Helpers::collectFuncVars($matches[3]);
+        $strToDecode = $matches[2];
+        $func1 = $vars[$matches[4]] ?? null;
+        $func2 = $vars[$matches[5]] ?? null;
+        if ($func1 !== null && $func2 !== null
+            && Helpers::convertToSafeFunc($func1) && Helpers::convertToSafeFunc($func2)) {
+            $strToDecode = Helpers::executeWrapper($func1, [
+                Helpers::executeWrapper($func2, [$strToDecode])
+            ]);
+        }
+
+        $len = strlen($strToDecode);
+        $res = '';
+        $func1 = $vars[$matches[10]] ?? null;
+        $func2 = $vars[$matches[11]] ?? null;
+        if ($func1 === 'chr' && $func2 === 'ord') {
+            for ($i = 0; $i < $len; $i++) {
+                $res .= $func1($func2($strToDecode[$i]) ^ (int)$matches[12]);
+            }
+        }
+
+        return $res;
+    }
+
+    private function deobfuscateB64FuncEval($str, $matches)
+    {
+        $key    = (strlen($matches[5]) > strlen($matches[7])) ? $matches[7] : $matches[5];
+        $data   = (strlen($matches[5]) > strlen($matches[7])) ? $matches[5] : $matches[7];
+        if (isset($matches[2]) && $matches[2] !== '') {
+            $key = base64_encode($key);
+        }
+        $res = Helpers::xorWithKey(base64_decode($data), $key);
+        if (isset($matches[3]) && $matches[3] !== '') {
+            $res = base64_decode($res);
+        }
+        return $res;
+    }
+
+    private function deobfuscateNullEcho($str, $matches)
+    {
+        $vars = [];
+        Helpers::collectConcatedVars($str, '\'', $vars, true);
+        $str = Helpers::replaceVarsFromArray($vars, $str, true);
+        return $str;
+    }
+
+    private function deobfuscateEvalB64Chunks($str, $matches)
+    {
+        $str = Helpers::replaceBase64Decode($str);
+        if (preg_match('~eval\(\'function\s*(\w+)\((\$\w+),(\$\w+)\)\{(\$\w+)=array\(((?:\d+\,?)+)\);if\(\3==(\d+)\)\s*\{\$\w+=substr\(\2,\4\[\d+\]\+\4\[\d+\],\4\[\d+\]\);\}elseif\(\3==(\d+)\)\s*\{\$\w+=substr\(\2,\4\[\d+\],\4\[\d+\]\);\}elseif\(\3==(\d+)\)\{\$\w+=trim\(substr\(\2,\4\[\d+\]\+\4\[\d+\]\+\4\[\d+\]\)\);}return\s*\$\w+;\}\'\);~msi', $str, $m)) {
+            $offsets = explode(',', $m[5]);
+            $offsets[0] = 1;
+            $value = '';
+            $str = preg_replace_callback('~' . $m[1] . '\(\$\w+\[\d+\],(\d+)\)~msi', function ($m2) use ($m, $matches, $offsets) {
+                if ($m2[1] === $m[6]) {
+                    $value = substr($matches[4], (int)$offsets[0] + (int)$offsets[1], $offsets[2]);
+                } else if ($m2[1] === $m[7]) {
+                    $value = substr($matches[4], (int)$offsets[0], (int)$offsets[1]);
+                } else if ($m2[1] === $m[8]) {
+                    $value = trim(substr($matches[4], (int)$offsets[0] + (int)$offsets[1] + (int)$offsets[2]));
+                }
+                return '\'' . $value . '\'';
+            }, $str);
+        }
+        $str = Helpers::replaceBase64Decode($str);
+        $code = '';
+        if (preg_match('~eval\(\'if\(\!function_exists\("([^"]+)"\)\)\{function\s*\1\((\$\w+),(\$\w+),(\$\w+)\)\s*\{(\$\w+)=implode\(\4\);\5=preg_replace\("[^"]+","",\5\);if[^{]+{return\(*((?:\w+\()+)\2\)\)\);}else{die\("[^"]+"\);}}}\'\);~msi', $str, $m)) {
+            preg_match('~eval\(' . $m[1] . '\(\'([^\']+)\',\'\w{32}\',\$\w+\)\);~msi', $str, $m2);
+            $code = 'eval(' . $m[6] . '\'' . $m2[1] . '\'' . str_repeat(')', substr_count($m[6], '(')) . ');';
+        }
+        $code = $this->deobfuscateEval($code, []);
+        return $code;
+    }
+
+    private function deobfuscateObStartFlushVar($str, $matches)
+    {
+        preg_match_all('~\d{1,5}~msi', $matches[4], $tcNums, PREG_SET_ORDER);
+        preg_match_all('~\d{1,5}~msi', $matches[6], $trNums, PREG_SET_ORDER);
+
+        $res = '';
+        foreach ($trNums as $tval) {
+            $res .= chr((int)$tcNums[(int)$tval[0]][0] + 32);
+        }
+
+        return '?> ' . $res;
+    }
+
+    private function deobfuscateArrayReplacing($str, $matches)
+    {
+        $dictionaryKey = $matches[1];
+        $dictionaryVal = $matches[2];
+
+        $result = Helpers::replaceVarsFromDictionary($dictionaryKey, $dictionaryVal, $str);
+        preg_match_all('~\$(\w{1,40})\s?=\s?\'(\w+)\';~', $result, $array, PREG_SET_ORDER);
+        foreach($array as &$value) {
+            $re = '~\$\{"GLOBALS"}\["'.$value[1].'"\]~';
+            $result = preg_replace($re, $value[2], $result);
+        }
+        return $result;
+    }
+
+    private function deobfuscateVarConcatedReplaceEval($str, $matches)
+    {
+        $tempStr = $matches[1];
+        $vars = [];
+        $vars = Helpers::collectVars($tempStr, '"', $vars, true);
+        $tempStr = Helpers::replaceVarsFromArray($vars, $tempStr, false, true);
+        $tempStr = Helpers::concatStringsInContent($tempStr);
+        $vars = Helpers::collectVars($tempStr, "'", $vars);
+        $result = str_replace($matches[1],'', $str);
+        $result = Helpers::replaceVarsFromArray($vars, $result, false, true);
+
+        return $this->unwrapFuncs($result);
+    }
+
+    private function deobfuscateVarsConcatedFuncStrReplaceEval($str, $matches)
+    {
+        $content = $str;
+        $vars = [$matches[1] => ''];
+        $vars = Helpers::collectVars($content, '"', $vars, true);
+        $vars = Helpers::getVarsFromDictionaryDynamically($vars, $content);
+        $result = Helpers::replaceVarsFromArray($vars, $matches[7], true, false) .
+            '"' .
+            str_replace($matches[8], $matches[6], $vars[$matches[1]]) . '"));';
+
+        return $this->unwrapFuncs($result);
+    }
+
+    private function deobfuscateB64GlobalVarsReplace($str, $matches)
+    {
+        $vars = [];
+        $varsStr = Helpers::replaceBase64Decode($matches[1], '"');
+        $vars = Helpers::collectVars($varsStr, '"',$vars);
+        $res = str_replace($matches[1], '', $str);
+
+        return Helpers::replaceVarsFromArray($vars, $res, false, true);
+    }
+
+    private function deobfuscateB64putContents($str, $matches)
+    {
+        return base64_decode($matches[1]);
+    }
+
+    private function deobfuscateB64WSO($str, $matches)
+    {
+        $code = Helpers::replaceBase64Decode($str);
+        $vars = [];
+        Helpers::collectConcatedVars($code, '\"', $vars, true);
+        $code = Helpers::replaceVarsFromArray($vars, $code, true, true);
+        return $code;
+    }
+
+    private function deobfuscateEvalFuncDict($str, $matches)
+    {
+        $res = Helpers::replaceVarsFromDictionary($matches[2], $matches[3], $matches[5]);
+        $res = preg_replace('~\'\s*\.\s*\'~', '', substr(trim($res), 1, -1));
+        $res .= $matches[6] . '\'' . str_repeat(')', substr_count($res, '(')) . ';';
+        return $res;
+    }
+
+    private function deobfuscateExplodeGzinflateSubstr($str, $matches)
+    {
+        $matches[4] = stripcslashes($matches[4]);
+        $strings = explode($matches[3], gzinflate(substr($matches[4], hexdec($matches[5]), (int)$matches[6])));
+        $res = str_replace($matches[1], '', $matches[0]);
+        $res = preg_replace_callback('~\$GLOBALS[\{\[].{1,3}[\}\]][\[\{]([0-9a-fx]+)[\]\}]~msi', function($m) use ($strings) {
+            return '\'' . $strings[hexdec($m[1])] . '\'';
+        }, $res);
+        return $res;
+    }
+
+    private function deobfuscateUrldecodeEval($str, $matches)
+    {
+        $dict = strpos($matches[1], 'urldecode') ? urldecode($matches[3]) : stripcslashes($matches[3]);
+        $tmp = Helpers::replaceVarsFromDictionary($matches[2], $dict, $matches[4]);
+        $data = [];
+        Helpers::collectConcatedVars($tmp, '\'', $data);
+        foreach($data as $var => $value) {
+            $tmp = Helpers::replaceVarsFromDictionary($var, $value, $tmp);
+        }
+        Helpers::collectConcatedVars($tmp, '\'', $data);
+        $res = '';
+        foreach ($data as $var => $value) {
+            $res .= $var . '=' . '\'' . $value . '\';';
+        }
+        $res .= str_replace([$matches[1], $matches[4]], '', $str);
+        $res = Helpers::replaceVarsFromArray($data, $res, true, false);
+        return $res;
+    }
+
+    private function deobfuscateStrtrEval($str, $matches)
+    {
+        $vars = [];
+        Helpers::collectVars($str, '\'', $vars);
+        $res = Helpers::replaceVarsFromArray($vars, $matches[4], false, false);
+        return $res;
+    }
+
+    private function deobfuscateEvalStrtr($str, $matches)
+    {
+        $res = '?> ';
+        $offset = (int) $matches[2];
+        $res .= base64_decode(strtr(substr($matches[1], $offset*2), substr($matches[1], $offset, $offset), substr($matches[1], 0, $offset)));
+        return $res;
+    }
+
+    private function deobfuscateCreateFuncHex2Bin($str, $matches)
+    {
+        $res = Helpers::replaceHex2Bin($str);
+        $vars = [];
+        Helpers::collectVars($res, '\'', $vars, true);
+        $res = Helpers::replaceVarsFromArray($vars, $res, true);
+        return $res;
+    }
+
+    private function deobfuscateAutoExploit($str, $matches)
+    {
+        return Helpers::replaceBase64Decode($str);
+    }
+
+    private function deobfuscateCreateFuncB64($str, $matches)
+    {
+        return base64_decode($matches[2]);
+    }
+
+    private function deobfuscateChrXor($str, $matches)
+    {
+        $data = explode($matches[4], $matches[5]);
+        $res = '';
+        foreach ($data as $chr) {
+            if ($chr === '') {
+                continue;
+            }
+            $res .= chr($chr ^ (int) $matches[2]);
+        }
+        return $res;
+    }
+    private function deobfuscateManyB64WithVarNorm($str, $matches)
+    {
+        $res = Helpers::replaceBase64Decode($str, '"');
+        if (strpos($res, '${$') !== false) {
+            $res = Helpers::postProcess($res);
+        }
+        return $res;
+    }
     /*************************************************************************************************************/
     /*                                          JS deobfuscators                                                 */
     /*************************************************************************************************************/
@@ -17832,19 +19883,27 @@ class Deobfuscator
     private function deobfuscateJS_fromCharCode($str, $matches)
     {
         $result = '';
-        $chars = explode(',', $matches[4]);
-        foreach ($chars as $char) {
-            $result .= chr((int)trim($char));
+        if (isset($matches[3]) && $matches[3] === 'eval(') {
+            $chars = explode(',', $matches[4]);
+            foreach ($chars as $char) {
+                $result .= chr((int)trim($char));
+            }
+            if (isset($matches[1]) && $matches[1] !== '') {
+                $result = $matches[1] . $result;
+            }
+            if (isset($matches[5]) && $matches[5] !== '') {
+                $result = $result . $matches[5];
+            }
+            return $result;
         }
-        if (!(isset($matches[3]) && $matches[3] === 'eval(')) {
-            $result = '\'' . $result . '\'';
-        }
-        if (isset($matches[1]) && $matches[1] !== '') {
-            $result = $matches[1] . $result;
-        }
-        if (isset($matches[5]) && $matches[5] !== '') {
-            $result = $result . $matches[5];
-        }
+
+        $result = preg_replace_callback('~String\.fromCharCode\(([\d,\s]+)\)~msi', function ($m) {
+            $chars = explode(',', $m[1]);
+            foreach ($chars as $char) {
+                $result .= chr((int)trim($char));
+            }
+            return '\'' . $result . '\'';
+        }, $str);
 
         return $result;
     }
@@ -17857,7 +19916,7 @@ class Deobfuscator
         $functionName = urldecode($matches[2]);
         $strDecoded = $matches[3];
 
-        if (preg_match('~function\s?(\w{1,50})\(\w{1,50}\)\s{0,50}{\s{0,50}var\s?\w{1,50}\s?=\s?[\'"]{2};\s{0,50}var\s?\w{1,50}\s?=\s?\w{1,50}\.split\("(\d+)"\);\s{0,50}\w{1,50}\s?=\s?unescape\(\w{1,50}\[0\]\);\s{0,50}\w{1,50}\s?=\s?unescape\(\w{1,50}\[1\]\s?\+\s?"(\d{1,50})"\);\s{0,50}for\(\s?var\s?\w{1,50}\s?=\s?0;\s?\w{1,50}\s?<\s?\w{1,50}\.length;\s?\w{1,50}\+\+\)\s?{\s{0,50}\w{1,50}\s?\+=\s?String\.fromCharCode\(\(parseInt\(\w{1,50}\.charAt\(\w{1,50}%\w{1,50}\.length\)\)\^\w{1,50}\.charCodeAt\(\w{1,50}\)\)\+-2\);\s{0,50}}\s{0,50}return\s\w{1,50};\s{0,50}}~msi',
+        if (preg_match('~function\s?(\w{1,50})\(\w{1,50}\)\s{0,50}{\s{0,50}var\s?\w{1,50}\s?=\s?[\'"]{2};\s{0,50}var\s?\w{1,50}\s?=\s?\w{1,50}\.split\("(\d+)"\);\s{0,50}\w{1,50}\s?=\s?unescape\(\w{1,50}\[0\]\);\s{0,50}\w{1,50}\s?=\s?unescape\(\w{1,50}\[1\]\s?\+\s?"(\d{1,50})"\);\s{0,50}for\(\s?var\s?\w{1,50}\s?=\s?0;\s?\w{1,50}\s?<\s?\w{1,50}\.length;\s?\w{1,50}\+\+\)\s?{\s{0,50}\w{1,50}\s?\+=\s?String\.fromCharCode\(\(parseInt\(\w{1,50}\.charAt\(\w{1,50}%\w{1,50}\.length\)\)\^\w{1,50}\.charCodeAt\(\w{1,50}\)\)\+([-+]?\d{1,5})\);\s{0,50}}\s{0,50}return\s\w{1,50};\s{0,50}}~msi',
                 $functionCode, $match) && strpos($functionName, $match[1])) {
             $tmp = explode((string)$match[2], $strDecoded);
             $s = urldecode($tmp[0]);
@@ -17866,7 +19925,7 @@ class Deobfuscator
             $sLen = strlen($s);
 
             for ($i = 0; $i < $sLen; $i++) {
-                $result .= chr(((int)($k[$i % $kLen]) ^ ord($s[$i])) - 2);
+                $result .= chr(((int)($k[$i % $kLen]) ^ ord($s[$i])) + (int)$match[4]);
             }
         } else {
             $result = $matches[3];
@@ -17922,7 +19981,19 @@ class Deobfuscator
         if (strpos($matches[1], '\u00') !== false) {
             $matches[1] = str_replace('\u00', '%', $matches[1]);
         }
-        return urldecode($matches[1]);
+        $res = urldecode($matches[1]);
+        if (isset($matches[2]) && isset($matches[3]) && $matches[2] !== ''
+            && strpos($res, 'function ' . $matches[2]) !== false && $matches[3] !== ''
+            && preg_match('~var\s*(\w+)=unescape\((\w+)\.substr\(0,\2\.length-1\)+;\s*var\s*(\w+)=\'\';for\((\w+)=0;\4<\1\.length;\4\+\+\)\3\+=String\.fromCharCode\(\1\.charCodeAt\(\4\)-s\.substr\(\2\.length-1,1\)+;document\.write\(unescape\(\3\)+;~msi', $res)
+        ) {
+            $tmp = urldecode($matches[3]);
+            $res = '';
+            for ($i = 0, $iMax = strlen($tmp); $i < $iMax; $i++) {
+                $res .= chr(ord($tmp[$i]) - (int)substr($matches[3], -1, 1));
+            }
+            $res = urldecode($res);
+        }
+        return $res;
     }
 
     private function deobfuscateJS_deanPacker($str, $matches)
@@ -17993,6 +20064,55 @@ class Deobfuscator
         }, $matches[2]);
 
         return $ret;
+    }
+
+    private function deobfuscateJS_B64Embedded($str, $matches)
+    {
+        return '<script type="text/javascript">' . PHP_EOL . base64_decode($matches[1]) . PHP_EOL . '</script>';
+    }
+
+    private function deobfuscateJS_ParseIntArray($str, $matches)
+    {
+        $delta = hexdec($matches[3]);
+        $array = explode('\',\'', substr($matches[10], 1, -1));
+        $i = 0;
+        while (true) {
+            $i++;
+            try {
+                $num = preg_replace_callback('~parseInt\(\_0x\w+\((\w+)\)\)~msi', function ($m) use ($array, $delta) {
+                    $index = hexdec($m[1]) - $delta;
+                    $item = $array[$index];
+                    preg_match('~\d+~', $item, $num);
+                    $num = isset($num[0]) ? (int)$num[0] : 0;
+                    return $num;
+                }, $matches[6]);
+                $num = preg_replace_callback('~0x\w+~msi', function ($m) {
+                    return hexdec($m[0]);
+                }, $num);
+                $num = (int)MathCalc::calcRawString($num);
+                $expected = hexdec($matches[7]);
+                if ($num === $expected) {
+                    break;
+                } else {
+                    $item = array_shift($array);
+                    $array[] = $item;
+                }
+            } catch (Exception $e) {
+                $item = array_shift($array);
+                $array[] = $item;
+            }
+        }
+
+        $code = preg_replace_callback('~_0x\w+\((0x\w+)\)~', function($m) use ($array, $delta) {
+            $index = hexdec($m[1]) - $delta;
+            return '\'' . $array[$index] . '\'';
+        }, $matches[9]);
+
+        $code = preg_replace_callback('~atob\(\'([^\']+)\'\)~', function($m) {
+            return '\'' . base64_decode($m[1]) . '\'';
+        }, $code);
+
+        return $code;
     }
 
     /*************************************************************************************************************/
@@ -18242,7 +20362,7 @@ class ContentObject
 class CleanUnit
 {
 
-    const URL_GRAB = '~<(script|iframe|object|embed|img|a)\s*.{0,300}?((?:https?:)?\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+\~#=]{2,256}\.[a-z]{2,4}\b(?:[-a-zA-Z0-9@:%_\+.\~#?&/=]*)).{0,300}?</\1>~msi';
+    const URL_GRAB = '~<(script|iframe|object|embed|img|a)\s*[^<]{0,300}?((?:https?:)?\\\\?/\\\\?/(?:www\.)?[-a-zA-Z0-9@:%._\+\~#=]{2,256}\.[a-z]{2,10}\b(?:[-a-zA-Z0-9@:%_\+.\~#?&/=\\\\]*)).{0,300}?</\1>~msi';
 
     public static function CleanContent(&$file_content, $clean_db, $deobfuscate = false, $unescape = false, $signature_converter = null, $precheck = null, $src_file = null, $demapper = false, &$matched_not_cleaned = null)
     {
@@ -18277,7 +20397,8 @@ class CleanUnit
                     if (!(isset($inj_sign) && $inj_sign)) {
                         $inj_sign = $rec['sig_match'];
                     }
-                    $nohang = 20; // maximum 20 iterations
+                    $nohang = 2000; // maximum 2000 iterations (counting all)
+                    $nohang2 = 20; //maximum 20 iterations (counting only if content length not changed)
                     $condition_num = 0; // for debug
                     while (
                         (
@@ -18317,6 +20438,7 @@ class CleanUnit
                             )
                         )
                         && ($nohang-- > 0)
+                        && ($nohang2 > 0)
                     ) {
                         if (trim($rec['sig_replace']) === '<?php') {
                             $rec['sig_replace'] = '<?php ';
@@ -18398,6 +20520,9 @@ class CleanUnit
                         }
 
                         $matched_not_cleaned = $content_orig->getContent() === $file_content;
+                        if(strlen($content->getContent()) === strlen($file_content)) {
+                            $nohang2--;
+                        }
 
                         if ($empty) {
                             $terminate = true;
@@ -18681,7 +20806,11 @@ class CleanUnit
                         $pos_obf = strpos($file_content, $obfuscated);
                         $len = strlen($obfuscated);
                         $file_content = self::replaceString($file_content, '', $pos_obf, $len);
-                        $result[] = ['sig_type' => 2, 'id' => $clean_db->getScanDB()->blackUrls->getSig($id), 'empty' => false];
+                        $result[] = [
+                            'sig_type' => 2,
+                            'id' => $clean_db->getScanDB()->blackUrls->getSig($id),
+                            'empty' => false
+                        ];
                     }
                 }
             }
@@ -18701,39 +20830,43 @@ class CleanUnit
                         $pos = Normalization::string_pos($file_content, $obfuscated);
                         if ($pos !== false) {
                             $file_content = self::replaceString($file_content, '', $pos[0], $pos[1] - $pos[0] + 1);
-                            $result[] = ['sig_type' => 2, 'id' => $clean_db->getScanDB()->blackUrls->getSig($id), 'empty' => false];
+                            $result[] = [
+                                'sig_type' => 2,
+                                'id' => $clean_db->getScanDB()->blackUrls->getSig($id),
+                                'empty' => false
+                            ];
                         }
                     }
                 }
             }
-            unset($content);
-            $content = new ContentObject($file_content, $deobfuscate, $unescape);
-            $offset = 0;
-            while (self::findBlackUrl($content->getUnescaped(), $fnd, $offset, $clean_db, $id)) {
-                $offset += $fnd[0][1] + strlen($fnd[0][0]);
-                $pos = Normalization::string_pos($file_content, $fnd[0][0]);
-                if ($pos !== false) {
-                    $replace = self::getReplaceFromRegExp('', $content->getUnescaped());
-                    $file_content = self::replaceString($file_content, $replace, $pos[0], $pos[1] - $pos[0] + 1);
-                    $result[] = ['sig_type' => 2, 'id' => $clean_db->getScanDB()->blackUrls->getSig($id), 'empty' => false];
-                }
-            }
-
-            unset($content);
-            $content = new ContentObject($file_content, $deobfuscate, $unescape);
-            $offset = 0;
-            while (self::findBlackUrl($content->getUnescapedNormalized(), $fnd, $offset, $clean_db, $id)) {
-                $offset += $fnd[0][1] + strlen($fnd[0][0]);
-                $pos = Normalization::string_pos($file_content, $fnd[0][0]);
-                if ($pos !== false) {
-                    $replace = self::getReplaceFromRegExp('', $content->getUnescapedNormalized());
-                    $file_content = self::replaceString($file_content, $replace, $pos[0], $pos[1] - $pos[0] + 1);
-                    $result[] = ['sig_type' => 2, 'id' => $clean_db->getScanDB()->blackUrls->getSig($id), 'empty' => false];
-                }
-            }
-            unset($content);
-            $content = new ContentObject($file_content, $deobfuscate, $unescape);
         }
+        unset($content);
+        $content = new ContentObject($file_content, $deobfuscate, $unescape);
+        $offset = 0;
+        while (self::findBlackUrl($content->getUnescaped(), $fnd, $offset, $clean_db, $id)) {
+            $offset += $fnd[0][1] + strlen($fnd[0][0]);
+            $pos = Normalization::string_pos($file_content, $fnd[0][0]);
+            if ($pos !== false) {
+                $replace = self::getReplaceFromRegExp('', $content->getUnescaped());
+                $file_content = self::replaceString($file_content, $replace, $pos[0], $pos[1] - $pos[0] + 1);
+                $result[] = ['sig_type' => 2, 'id' => $clean_db->getScanDB()->blackUrls->getSig($id), 'empty' => false];
+            }
+        }
+
+        unset($content);
+        $content = new ContentObject($file_content, $deobfuscate, $unescape);
+        $offset = 0;
+        while (self::findBlackUrl($content->getUnescapedNormalized(), $fnd, $offset, $clean_db, $id)) {
+            $offset += $fnd[0][1] + strlen($fnd[0][0]);
+            $pos = Normalization::string_pos($file_content, $fnd[0][0]);
+            if ($pos !== false) {
+                $replace = self::getReplaceFromRegExp('', $content->getUnescapedNormalized());
+                $file_content = self::replaceString($file_content, $replace, $pos[0], $pos[1] - $pos[0] + 1);
+                $result[] = ['sig_type' => 2, 'id' => $clean_db->getScanDB()->blackUrls->getSig($id), 'empty' => false];
+            }
+        }
+        unset($content);
+        $content = new ContentObject($file_content, $deobfuscate, $unescape);
     }
 
     private static function findBlackUrl($item, &$fnd, $offset, $clean_db, &$id)
