@@ -2,6 +2,7 @@
   "applications": {
     "wp_core": {
       "domain_name": "SELECT option_value from %db%.%prefix%options WHERE option_name = 'siteurl';",
+      "config_file": "wp-config.php",
       "wp_comments": {
         "key": "comment_ID",
         "fields": [
@@ -13,7 +14,8 @@
         "key": "ID",
         "fields": [
           "post_content"
-        ]
+        ],
+        "escaped" : true
       },
       "wp_options": {
         "key": "option_id",
@@ -28,11 +30,12 @@
       }
     },
     "joomla_core": {
-      "joomla_something": {
+      "config_file": "configuration.php",
+      "jos_content": {
         "key": "id",
         "fields": [
-          "comments",
-          "posts"
+          "introtext",
+          "fulltext"
         ]
       }
     }

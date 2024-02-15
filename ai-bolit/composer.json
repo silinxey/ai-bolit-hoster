@@ -1,0 +1,42 @@
+{
+    "name": "cloudlinux/aibolit",
+    "type": "library",
+    "description": "AI-BOLIT scanner is designed to scan the site for viruses and malware.",
+    "require": {
+        "php": ">=7.2",
+        "ext-json": "*",
+        "ext-zlib": "*",
+        "ext-zip": "*",
+        "ext-iconv": "*",
+        "ext-mbstring": "*",
+        "ext-shmop": "*",
+        "ext-posix": "*",
+        "ext-pcntl": "*",
+        "ext-openssl": "*",
+        "ext-leveldb": "*",
+        "ext-mysqli": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.5",
+        "dms/phpunit-arraysubset-asserts": "*",
+        "smi2/phpclickhouse": "*"
+    },
+    "autoload":{
+        "psr-4":{
+            "Aibolit\\Lib\\": "github/lib",
+            "Aibolit\\Tests\\Util\\": "tests/util"
+        }
+    },
+    "scripts": {
+        "build": "cd AIBOLIT_RELEASE && ./release_aibolit_ru.sh && cd ..",
+        "build-with-db-cache": "cd AIBOLIT_RELEASE && ./release_aibolit_ru.sh -c && cd ..",
+        "test": "phpunit",
+        "test-scafore": "AIBOLIT_TEST_CONFIG=scafore phpunit",
+        "smoke-test-scafore": "AIBOLIT_TEST_CONFIG=scafore phpunit --exclude-group=heavy,skipped,must_be_root",
+
+        "check-my-code": [
+            "@build",
+            "@smoke-test-scafore"
+        ]
+    }
+}
